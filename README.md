@@ -168,9 +168,28 @@ If you paste this compose into a Dokploy **Compose** service, two things differ 
    - ../files/config.alloy:/etc/alloy/config.alloy:ro
    ```
 
-   and upload `config.alloy` through the Dokploy UI. This is the only line that changes.
+   This is the only line that changes.
+
+   Then create the config file in the Dokploy UI (**Advanced → Mounts → File Mount**):
+
+   | Field      | Value                                |
+   | ---------- | ------------------------------------ |
+   | File Path  | `config.alloy`                       |
+   | Mount Path | `/etc/alloy/config.alloy`            |
+   | Content    | the contents of `files/config.alloy` |
 
 2. **The log source.** `/etc/dokploy/traefik/dynamic` already holds `access.log` on a Dokploy host. On a plain VPS without Dokploy, point that mount at whatever directory your Traefik instance writes access logs to, and adjust `__path__` in `files/config.alloy` to match.
+
+### Two copies of `config.alloy`
+
+The Dokploy File Mount writes its own file, and that is the one the container actually runs:
+
+| Copy       | Path                                              | Used by                            |
+| ---------- | ------------------------------------------------- | ---------------------------------- |
+| Repository | `files/config.alloy`                              | `docker compose` on this checkout  |
+| Dokploy    | `/etc/dokploy/compose/<app>/files/config.alloy`   | the deployed service               |
+
+They are independent files. Editing and committing the repository copy does **not** change the deployed pipeline: paste the updated content into the File Mount (Dokploy keeps it across deployments), or the VPS keeps shipping logs through the old config with no error to tell you.
 
 Set `VPS_NAME` and `LOKI_PUSH_URL` in the Dokploy Environment tab. Dokploy injects them as compose environment variables, so no `.env` file is needed there.
 
