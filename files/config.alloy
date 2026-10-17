@@ -1,0 +1,104 @@
+// Alloy agent for a VPS monitored by a central Grafana stack.
+//
+// Source: Traefik access log, bind-mounted read-only at /var/log/traefik.
+// Sink:   Loki, via the LOKI_PUSH_URL environment variable.
+// Labels: every stream carries job="traefik" plus vps=$VPS_NAME.
+//
+// Traefik emits access logs in "common" (CLF) format by default and in JSON
+// when accessLog.format is set to json. Both are handled below, so switching
+// the format later does not require editing this file.
+//
+// Dokploy writes the access log to /etc/dokploy/traefik/dynamic/access.log,
+// which the compose file mounts at /var/log/traefik.
+
+logging {
+  level  = "info"
+  format = "logfmt"
+}
+
+// ---------------------------------------------------------------------------
+// Read the access log.
+//
+// The exact path is used on purpose: loki.source.file does not expand glob
+// patterns unless the file_match block is enabled, and a silently unmatched
+// glob means zero logs. To also pick up rotated files, replace __path__ with
+// "/var/log/traefik/*.log" and uncomment the file_match block below.
+// ---------------------------------------------------------------------------
+loki.source.file "traefik" {
+  targets = [
+    {
+      __path__ = "/var/log/traefik/access.log",
+      job      = "traefik",
+      vps      = sys.env("VPS_NAME"),
+    },
+  ]
+
+  forward_to = [loki.process.traefik.receiver]
+
+  // file_match {
+  //   enabled     = true
+  //   sync_period = "10s"
+  // }
+}
+
+// ---------------------------------------------------------------------------
+// Extract labels from both access log formats.
+//
+// The two stages are not mutually exclusive at runtime: for a JSON line the
+// regex stage does not match and leaves the extracted map untouched, and for a
+// CLF line the JSON stage reports malformed input but drop_malformed = false
+// lets the entry through unlabelled instead of dropping it.
+// ---------------------------------------------------------------------------
+loki.process "traefik" {
+  // Format: json (Traefik accessLog.format: json).
+  stage.json {
+    expressions = {
+      method  = "RequestMethod",
+      router  = "RouterName",
+      service = "ServiceName",
+      status  = "DownstreamStatus",
+    }
+
+    drop_malformed = false
+  }
+
+  // Format: common (CLF), the Traefik/Dokploy default.
+  // router and service are not present in CLF, so they stay empty here.
+  stage.regex {
+    expression = `^(?P<client_ip>\S+) \S+ \S+ \[(?P<date>[^\]]+)\] "(?P<method>\S+) (?P<path>\S+) [^"]*" (?P<status>\d{3}) \S+`
+  }
+
+  // Promote only low-cardinality values to labels. client_ip and path are
+  // deliberately not labelled: they are high-cardinality and would explode
+  // the index. Use stage.structured_metadata for those if you need them.
+  stage.labels {
+    values = {
+      method  = "",
+      router  = "",
+      service = "",
+      status  = "",
+    }
+  }
+
+  forward_to = [loki.write.central.receiver]
+}
+
+// ---------------------------------------------------------------------------
+// Ship to the central Loki.
+// ---------------------------------------------------------------------------
+loki.write "central" {
+  endpoint {
+    url = sys.env("LOKI_PUSH_URL")
+  }
+
+  // If your Loki sits behind basic auth, replace the endpoint block above
+  // with:
+  //
+  // endpoint {
+  //   url = sys.env("LOKI_PUSH_URL")
+  //   basic_auth {
+  //     username = sys.env("LOKI_USER")
+  //     password = sys.env("LOKI_PASSWORD")
+  //   }
+  // }
+}
