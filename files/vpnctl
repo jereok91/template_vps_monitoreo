@@ -1,0 +1,762 @@
+#!/bin/sh
+#
+# vpnctl - isolated WireGuard client for the VPS monitoring template.
+#
+# This runs inside the dedicated VPN container (client mode, BusyBox ash) and
+# deliberately does NOT use wg-quick:
+#
+#   * wg-quick directives are rejected, so no hook ever runs;
+#   * DNS is validated but ignored (no /etc/resolv.conf is touched);
+#   * the interface, address, routes, traffic guard and readiness marker are
+#     created explicitly from a validated, sanitized configuration;
+#   * the default route is removed only after the WireGuard endpoint host route
+#     is pinned, so monitoring traffic can never silently fall back to public
+#     egress.
+#
+# Readiness and connectivity are different claims: `healthcheck` reports whether
+# the interface, address, routes and guard are in place, while `verify` is the
+# only subcommand that claims a (recent) handshake.
+#
+# Every error message names the field, directive or variable only. Private keys,
+# preshared keys and any other configuration value are never written to stdout,
+# stderr or a log file.
+#
+# Subcommands:
+#   check-config   validate the configuration and print the resolved plan
+#
+# Usage: vpnctl [-h|--help] [check-config]
+
+set -u
+
+VPNCTL_VERSION=1
+
+# ---------------------------------------------------------------------------
+# Environment (all values are validated before they reach ip/wg/iptables)
+# ---------------------------------------------------------------------------
+# Whether the operator pinned the config path explicitly (checked before defaulting,
+# so the WG_CONFIG_BASE64 fallback is not mistaken for a second input).
+CONFIG_FILE_EXPLICIT=0
+if [ -n "${VPN_CONFIG_FILE+set}" ]; then
+  CONFIG_FILE_EXPLICIT=1
+fi
+VPN_CONFIG_FILE="${VPN_CONFIG_FILE:-/config/wg0.conf}"
+WG_CONFIG_BASE64="${WG_CONFIG_BASE64:-}"
+
+VPN_RUN_DIR="${VPN_RUN_DIR:-/run/vpn}"
+VPN_WG_IFACE="${VPN_WG_IFACE:-wg0}"
+VPN_TEXTFILE_DIR="${VPN_TEXTFILE_DIR:-/var/lib/node_exporter/textfile}"
+VPN_HOST_PROC="${VPN_HOST_PROC:-/host/proc}"
+VPN_HOSTNET_INTERVAL="${VPN_HOSTNET_INTERVAL:-15}"
+VPN_HOSTNET_ONCE="${VPN_HOSTNET_ONCE:-0}"
+VPN_SUPERVISE_INTERVAL="${VPN_SUPERVISE_INTERVAL:-10}"
+VPN_HANDSHAKE_MAX_AGE="${VPN_HANDSHAKE_MAX_AGE:-180}"
+
+VPN_ALLOWED_IPV4_MIN_PREFIX="${VPN_ALLOWED_IPV4_MIN_PREFIX:-24}"
+VPN_EXPORTER_PORTS="${VPN_EXPORTER_PORTS:-9100,8080}"
+VPN_ENDPOINT_IP="${VPN_ENDPOINT_IP:-}"
+
+VPS_NAME="${VPS_NAME:-}"
+LOKI_PUSH_URL="${LOKI_PUSH_URL:-}"
+
+# Absolute path to this script, used to spawn `hostnet-loop` in the background.
+SELF=$0
+case "$SELF" in
+  "") SELF=vpnctl ;;
+  */*) ;;
+  *) SELF="./${SELF}" ;;
+esac
+SELF_SHELL="${VPNCTL_SHELL:-/bin/sh}"
+
+READY_FILE="${VPN_RUN_DIR}/ready"
+SETCONF_FILE="${VPN_RUN_DIR}/${VPN_WG_IFACE}.setconf"
+DECODED_FILE=''
+
+HOSTNET_PID=''
+HOSTNET_SLEEP_PID=''
+SUPERVISE_SLEEP_PID=''
+
+# ---------------------------------------------------------------------------
+# Messages
+# ---------------------------------------------------------------------------
+log() {
+  printf 'vpnctl: %s\n' "$*" >&2
+}
+
+die() {
+  die_code=$1
+  shift
+  printf 'vpnctl: %s\n' "$*" >&2
+  exit "$die_code"
+}
+
+usage() {
+  cat <<'USAGE'
+vpnctl - isolated WireGuard client for the monitoring template
+
+Usage: vpnctl [SUBCOMMAND]
+
+Subcommands:
+  check-config    Validate the client configuration and print the resolved plan.
+                  Pure: no ip/wg/iptables call, no write outside VPN_RUN_DIR.
+  -h, --help      Show this help.
+
+Environment:
+  VPN_CONFIG_FILE            client config (default /config/wg0.conf)
+  WG_CONFIG_BASE64           base64 of the whole config (base64 is NOT encryption)
+  VPN_RUN_DIR                runtime directory (default /run/vpn)
+  VPN_WG_IFACE               tunnel interface (default wg0)
+  VPN_TEXTFILE_DIR           textfile collector directory
+                             (default /var/lib/node_exporter/textfile)
+  VPN_HOST_PROC              host proc mount (default /host/proc)
+  VPN_HOSTNET_INTERVAL       hostnet-loop period in seconds (default 15)
+  VPN_HOSTNET_ONCE           emit once and exit (default 0)
+  VPN_SUPERVISE_INTERVAL     supervisor period in seconds (default 10)
+  VPN_HANDSHAKE_MAX_AGE      maximum handshake age for `verify` (default 180)
+  VPN_ALLOWED_IPV4_MIN_PREFIX  most permissive allowed AllowedIPs prefix (default 24)
+  VPN_EXPORTER_PORTS         comma-separated exporter ports (default 9100,8080)
+  VPN_ENDPOINT_IP            explicit endpoint IPv4, skips hostname resolution
+  VPS_NAME                   identity of this VPS (required by check-config/up)
+  LOKI_PUSH_URL              Loki push URL over the tunnel (required, IPv4 host)
+
+Notes:
+  * Exactly one configuration input must be supplied: the mounted file or the
+    base64 fallback. Supplying both is rejected as ambiguous.
+  * wg-quick hooks (PreUp/PostUp/PreDown/PostDown), Table and SaveConfig are
+    rejected: nothing is executed on the host and no route is taken implicitly.
+  * DNS entries are validated and ignored inside the isolated namespace.
+USAGE
+}
+
+# ---------------------------------------------------------------------------
+# Value validation helpers. None of them prints or logs its input.
+# ---------------------------------------------------------------------------
+valid_key() {
+  vk_key=$1
+  [ "${#vk_key}" -eq 44 ] || return 1
+  case "$vk_key" in
+    *=) ;;
+    *) return 1 ;;
+  esac
+  vk_body=${vk_key%=}
+  case "$vk_body" in
+    ''|*[!A-Za-z0-9+/]*) return 1 ;;
+  esac
+  return 0
+}
+
+valid_ipv4() {
+  v4_ip=$1
+  case "$v4_ip" in
+    ''|*[!0-9.]*) return 1 ;;
+    .*|*.|*..*) return 1 ;;
+  esac
+  v4_count=0
+  v4_rest=$v4_ip
+  while [ -n "$v4_rest" ]; do
+    case "$v4_rest" in
+      *.*) v4_oct=${v4_rest%%.*}; v4_rest=${v4_rest#*.} ;;
+      *) v4_oct=$v4_rest; v4_rest='' ;;
+    esac
+    case "$v4_oct" in
+      ''|*[!0-9]*) return 1 ;;
+      0*[0-9]*) return 1 ;;
+    esac
+    [ "${#v4_oct}" -le 3 ] || return 1
+    [ "$v4_oct" -le 255 ] || return 1
+    v4_count=$((v4_count + 1))
+  done
+  [ "$v4_count" -eq 4 ] || return 1
+  return 0
+}
+
+# Result is left in IP_INT (no subshell, no output).
+ip_to_int() {
+  i2i_rest=$1
+  i2i_val=0
+  i2i_idx=0
+  while [ -n "$i2i_rest" ]; do
+    case "$i2i_rest" in
+      *.*) i2i_oct=${i2i_rest%%.*}; i2i_rest=${i2i_rest#*.} ;;
+      *) i2i_oct=$i2i_rest; i2i_rest='' ;;
+    esac
+    case "$i2i_idx" in
+      0) i2i_val=$((i2i_oct * 16777216)) ;;
+      1) i2i_val=$((i2i_val + i2i_oct * 65536)) ;;
+      2) i2i_val=$((i2i_val + i2i_oct * 256)) ;;
+      *) i2i_val=$((i2i_val + i2i_oct)) ;;
+    esac
+    i2i_idx=$((i2i_idx + 1))
+  done
+  IP_INT=$i2i_val
+}
+
+# require_uint <value> <variable-name>: positive integer, no leading zero.
+require_uint() {
+  case "$1" in
+    ''|*[!0-9]*|0*) die 2 "$2 must be a positive integer" ;;
+  esac
+  return 0
+}
+
+valid_prefix() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+    0*[0-9]*) return 1 ;;
+  esac
+  [ "${#1}" -le 2 ] || return 1
+  [ "$1" -le 32 ] || return 1
+  return 0
+}
+
+valid_port() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+    0*) return 1 ;;
+  esac
+  [ "${#1}" -le 5 ] || return 1
+  [ "$1" -ge 1 ] || return 1
+  [ "$1" -le 65535 ] || return 1
+  return 0
+}
+
+valid_hostname() {
+  case "$1" in
+    ''|*[!A-Za-z0-9.-]*) return 1 ;;
+  esac
+  case "$1" in
+    [A-Za-z0-9]|[A-Za-z0-9]*[A-Za-z0-9]) return 0 ;;
+  esac
+  return 1
+}
+
+# cidr_contains <cidr> <ipv4>
+cidr_contains() {
+  cc_cidr=$1
+  cc_ip=$2
+  case "$cc_cidr" in
+    */*) ;;
+    *) return 1 ;;
+  esac
+  cc_net=${cc_cidr%%/*}
+  cc_pfx=${cc_cidr#*/}
+  valid_ipv4 "$cc_net" || return 1
+  valid_ipv4 "$cc_ip" || return 1
+  valid_prefix "$cc_pfx" || return 1
+  ip_to_int "$cc_net"
+  cc_netint=$IP_INT
+  ip_to_int "$cc_ip"
+  cc_ipint=$IP_INT
+  cc_mask=0
+  cc_i=0
+  while [ "$cc_i" -lt "$cc_pfx" ]; do
+    cc_mask=$(((cc_mask >> 1) | 0x80000000))
+    cc_i=$((cc_i + 1))
+  done
+  [ "$((cc_netint & cc_mask))" -eq "$((cc_ipint & cc_mask))" ] || return 1
+  return 0
+}
+
+# join_csv <space separated words>
+join_csv() {
+  jc_out=''
+  for jc_item in $1; do
+    if [ -z "$jc_out" ]; then
+      jc_out=$jc_item
+    else
+      jc_out="${jc_out},${jc_item}"
+    fi
+  done
+  printf '%s' "$jc_out"
+}
+
+# ---------------------------------------------------------------------------
+# Input resolution: exactly one of the mounted file or the base64 fallback.
+# ---------------------------------------------------------------------------
+decode_base64() {
+  if command -v base64 >/dev/null 2>&1; then
+    if base64 -d </dev/null >/dev/null 2>&1; then
+      base64 -d
+      return $?
+    fi
+    if base64 -D </dev/null >/dev/null 2>&1; then
+      base64 -D
+      return $?
+    fi
+  fi
+  if command -v openssl >/dev/null 2>&1; then
+    openssl base64 -d -A
+    return $?
+  fi
+  printf 'vpnctl: no base64 decoder available (base64 or openssl)\n' >&2
+  return 1
+}
+
+resolve_config() {
+  CONF_SRC=''
+  DECODED_CONFIG=0
+
+  rs_has_b64=0
+  [ -n "$WG_CONFIG_BASE64" ] && rs_has_b64=1
+
+  if [ "$rs_has_b64" = 1 ]; then
+    rs_conflict=0
+    [ "$CONFIG_FILE_EXPLICIT" = 1 ] && rs_conflict=1
+    [ -e "$VPN_CONFIG_FILE" ] && rs_conflict=1
+    if [ "$rs_conflict" = 1 ]; then
+      die 2 "ambiguous configuration input: set either VPN_CONFIG_FILE or WG_CONFIG_BASE64, not both"
+    fi
+    mkdir -p "$VPN_RUN_DIR" 2>/dev/null || die 2 "cannot create VPN_RUN_DIR=$VPN_RUN_DIR"
+    rs_out="${VPN_RUN_DIR}/${VPN_WG_IFACE}.conf"
+    (umask 077; printf '%s\n' "$WG_CONFIG_BASE64" | decode_base64 >"$rs_out") ||
+      die 2 "WG_CONFIG_BASE64 could not be decoded (base64 is not encryption)"
+    chmod 600 "$rs_out" 2>/dev/null || true
+    [ -s "$rs_out" ] || die 2 "WG_CONFIG_BASE64 decoded to an empty configuration"
+    CONF_SRC=$rs_out
+    DECODED_CONFIG=1
+    DECODED_FILE=$rs_out
+    return 0
+  fi
+
+  if [ -d "$VPN_CONFIG_FILE" ]; then
+    die 2 "configuration path is a directory, not a file: $VPN_CONFIG_FILE"
+  fi
+  if [ ! -f "$VPN_CONFIG_FILE" ]; then
+    die 2 "configuration file not found: $VPN_CONFIG_FILE (mount the generated client config read-only, or provide WG_CONFIG_BASE64)"
+  fi
+  CONF_SRC=$VPN_CONFIG_FILE
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Strict configuration parser. Reads stdin; stores values in V_* variables.
+# ---------------------------------------------------------------------------
+parse_config() {
+  pc_lineno=0
+  CUR_SECTION=''
+  SEC_IFACE=0
+  SEC_PEER=0
+
+  H_PrivateKey=0; V_PrivateKey=''
+  H_Address=0; V_Address=''
+  H_ListenPort=0; V_ListenPort=''
+  H_DNS=0; V_DNS=''
+  H_MTU=0; V_MTU=''
+  H_FwMark=0; V_FwMark=''
+  H_PublicKey=0; V_PublicKey=''
+  H_PresharedKey=0; V_PresharedKey=''
+  H_AllowedIPs=0; V_AllowedIPs=''
+  H_Endpoint=0; V_Endpoint=''
+  H_PersistentKeepalive=0; V_PersistentKeepalive=''
+
+  while IFS= read -r pc_raw || [ -n "$pc_raw" ]; do
+    pc_lineno=$((pc_lineno + 1))
+    pc_line=$(printf '%s' "$pc_raw" | tr -d '\r')
+    pc_line=$(printf '%s' "$pc_line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    [ -n "$pc_line" ] || continue
+    case "$pc_line" in
+      '#'*|';'*) continue ;;
+    esac
+
+    # Section header?
+    case "$pc_line" in
+      '['*)
+        case "$pc_line" in
+          *']') ;;
+          *) die 2 "malformed section header on line $pc_lineno" ;;
+        esac
+        pc_sec=${pc_line#\[}
+        pc_sec=${pc_sec%\]}
+        case "$pc_sec" in
+          Interface)
+            [ "$SEC_IFACE" = 1 ] && die 2 "duplicate [Interface] section"
+            SEC_IFACE=1
+            ;;
+          Peer)
+            [ "$SEC_PEER" = 1 ] && die 2 "duplicate [Peer] section"
+            SEC_PEER=1
+            ;;
+          *) die 2 "unsupported section [$pc_sec]: only [Interface] and [Peer] are accepted" ;;
+        esac
+        CUR_SECTION=$pc_sec
+        continue
+        ;;
+    esac
+
+    case "$pc_line" in
+      *=*) ;;
+      *) die 2 "malformed line $pc_lineno: expected 'key = value'" ;;
+    esac
+    [ -n "$CUR_SECTION" ] ||
+      die 2 "directive on line $pc_lineno appears before the [Interface] section"
+
+    pc_key=${pc_line%%=*}
+    pc_key=$(printf '%s' "$pc_key" | sed -e 's/[[:space:]]*$//')
+    pc_val=${pc_line#*=}
+    pc_val=$(printf '%s' "$pc_val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/[[:space:]]#.*$//')
+    [ -n "$pc_key" ] || die 2 "malformed line $pc_lineno: expected 'key = value'"
+
+    # wg-quick only directives: rejected by name, never executed, value never echoed.
+    case "$pc_key" in
+      PreUp|PostUp|PreDown|PostDown|Table|SaveConfig)
+        die 2 "wg-quick directive $pc_key is not supported: vpnctl never runs hooks or takes routes implicitly"
+        ;;
+    esac
+
+    if [ "$CUR_SECTION" = Interface ]; then
+      case "$pc_key" in
+        PrivateKey)
+          [ "$H_PrivateKey" = 1 ] && die 2 "duplicate PrivateKey in [Interface]"
+          H_PrivateKey=1; V_PrivateKey=$pc_val
+          ;;
+        Address)
+          [ "$H_Address" = 1 ] && die 2 "duplicate Address in [Interface]"
+          H_Address=1; V_Address=$pc_val
+          ;;
+        ListenPort)
+          [ "$H_ListenPort" = 1 ] && die 2 "duplicate ListenPort in [Interface]"
+          H_ListenPort=1; V_ListenPort=$pc_val
+          ;;
+        DNS)
+          [ "$H_DNS" = 1 ] && die 2 "duplicate DNS in [Interface]"
+          H_DNS=1; V_DNS=$pc_val
+          ;;
+        MTU)
+          [ "$H_MTU" = 1 ] && die 2 "duplicate MTU in [Interface]"
+          H_MTU=1; V_MTU=$pc_val
+          ;;
+        FwMark)
+          [ "$H_FwMark" = 1 ] && die 2 "duplicate FwMark in [Interface]"
+          H_FwMark=1; V_FwMark=$pc_val
+          ;;
+        PublicKey|PresharedKey|AllowedIPs|Endpoint|PersistentKeepalive)
+          die 2 "directive $pc_key is not valid in [Interface]"
+          ;;
+        *) die 2 "unsupported directive $pc_key" ;;
+      esac
+    else
+      case "$pc_key" in
+        PublicKey)
+          [ "$H_PublicKey" = 1 ] && die 2 "duplicate PublicKey in [Peer]"
+          H_PublicKey=1; V_PublicKey=$pc_val
+          ;;
+        PresharedKey)
+          [ "$H_PresharedKey" = 1 ] && die 2 "duplicate PresharedKey in [Peer]"
+          H_PresharedKey=1; V_PresharedKey=$pc_val
+          ;;
+        AllowedIPs)
+          [ "$H_AllowedIPs" = 1 ] && die 2 "duplicate AllowedIPs in [Peer]"
+          H_AllowedIPs=1; V_AllowedIPs=$pc_val
+          ;;
+        Endpoint)
+          [ "$H_Endpoint" = 1 ] && die 2 "duplicate Endpoint in [Peer]"
+          H_Endpoint=1; V_Endpoint=$pc_val
+          ;;
+        PersistentKeepalive)
+          [ "$H_PersistentKeepalive" = 1 ] && die 2 "duplicate PersistentKeepalive in [Peer]"
+          H_PersistentKeepalive=1; V_PersistentKeepalive=$pc_val
+          ;;
+        PrivateKey|Address|ListenPort|DNS|MTU|FwMark)
+          die 2 "directive $pc_key is not valid in [Peer]"
+          ;;
+        *) die 2 "unsupported directive $pc_key" ;;
+      esac
+    fi
+  done
+
+  [ "$SEC_IFACE" = 1 ] || die 2 "configuration is missing the [Interface] section"
+  [ "$SEC_PEER" = 1 ] || die 2 "configuration is missing the [Peer] section"
+  [ "$H_PrivateKey" = 1 ] || die 2 "configuration is missing PrivateKey in [Interface]"
+  [ "$H_Address" = 1 ] || die 2 "configuration is missing Address in [Interface]"
+  [ "$H_PublicKey" = 1 ] || die 2 "configuration is missing PublicKey in [Peer]"
+  [ "$H_AllowedIPs" = 1 ] || die 2 "configuration is missing AllowedIPs in [Peer]"
+  [ "$H_Endpoint" = 1 ] || die 2 "configuration is missing Endpoint in [Peer]"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Semantic validation. Fills the resolved plan variables.
+# ---------------------------------------------------------------------------
+parse_peer_address() {
+  ppa_norm=$(printf '%s' "$1" | tr ',' ' ')
+  ppa_count=0
+  ppa_addr=''
+  ppa_pfx=''
+  for ppa_e in $ppa_norm; do
+    ppa_count=$((ppa_count + 1))
+    [ "$ppa_count" -le 1 ] || die 2 "Address must contain exactly one IPv4 address"
+    ppa_item=$ppa_e
+    case "$ppa_item" in
+      *:*) die 2 "Address must be IPv4: IPv6 tunnel addresses are not supported" ;;
+    esac
+    case "$ppa_item" in
+      */*) ppa_addr=${ppa_item%%/*}; ppa_pfx=${ppa_item#*/} ;;
+      *) ppa_addr=$ppa_item; ppa_pfx=32 ;;
+    esac
+    valid_ipv4 "$ppa_addr" || die 2 "invalid Address: expected an IPv4 address (a.b.c.d[/prefix])"
+    valid_prefix "$ppa_pfx" || die 2 "invalid Address prefix: expected 0-32"
+  done
+  [ "$ppa_count" -eq 1 ] || die 2 "Address must contain exactly one IPv4 address"
+  PEER_ADDR=$ppa_addr
+  PEER_PREFIX=$ppa_pfx
+}
+
+parse_allowed_ips() {
+  pai_norm=$(printf '%s' "$1" | tr ',' ' ')
+  ALLOWED_ROUTES=''
+  pai_count=0
+  for pai_e in $pai_norm; do
+    case "$pai_e" in
+      *:*) die 2 "AllowedIPs must be IPv4: IPv6 routes are not supported" ;;
+    esac
+    case "$pai_e" in
+      */*) pai_net=${pai_e%%/*}; pai_pfx=${pai_e#*/} ;;
+      *) die 2 "invalid AllowedIPs entry: expected a.b.c.d/n" ;;
+    esac
+    valid_ipv4 "$pai_net" || die 2 "invalid AllowedIPs entry: expected a.b.c.d/n"
+    valid_prefix "$pai_pfx" || die 2 "invalid AllowedIPs prefix: expected 0-32"
+    [ "$pai_pfx" = 0 ] &&
+      die 2 "AllowedIPs must not contain the default route (0.0.0.0/0): monitoring traffic may not tunnel everything"
+    if [ "$pai_pfx" -lt "$VPN_ALLOWED_IPV4_MIN_PREFIX" ]; then
+      die 2 "AllowedIPs entry is broader than the allowed minimum /$VPN_ALLOWED_IPV4_MIN_PREFIX: keep routing scoped to the central monitoring address"
+    fi
+    case "$pai_net" in
+      127.*) die 2 "AllowedIPs must not contain the loopback network" ;;
+    esac
+    ALLOWED_ROUTES="${ALLOWED_ROUTES} ${pai_net}/${pai_pfx}"
+    pai_count=$((pai_count + 1))
+  done
+  [ "$pai_count" -ge 1 ] || die 2 "AllowedIPs must list at least one IPv4 CIDR"
+  return 0
+}
+
+parse_loki_url() {
+  pl_url=$LOKI_PUSH_URL
+  case "$pl_url" in
+    http://*) pl_rest=${pl_url#http://}; pl_default_port=80 ;;
+    https://*) pl_rest=${pl_url#https://}; pl_default_port=443 ;;
+    *) die 2 "LOKI_PUSH_URL must start with http:// or https://" ;;
+  esac
+  pl_authority=${pl_rest%%/*}
+  [ -n "$pl_authority" ] || die 2 "LOKI_PUSH_URL has no host"
+  case "$pl_authority" in
+    '['*) die 2 "LOKI_PUSH_URL host must be an IPv4 literal: bracketed IPv6 is not supported" ;;
+    *:*) pl_host=${pl_authority%%:*}; pl_port=${pl_authority#*:} ;;
+    *) pl_host=$pl_authority; pl_port='' ;;
+  esac
+  case "$pl_host" in
+    *:*|'') die 2 "LOKI_PUSH_URL host must be an IPv4 literal" ;;
+  esac
+  valid_ipv4 "$pl_host" || die 2 "LOKI_PUSH_URL host must be an IPv4 literal: exporters and Loki are reached through the tunnel by address"
+  if [ -n "$pl_port" ]; then
+    valid_port "$pl_port" || die 2 "LOKI_PUSH_URL port must be 1-65535"
+  else
+    pl_port=$pl_default_port
+  fi
+  HUB_IP=$pl_host
+  LOKI_PORT=$pl_port
+  return 0
+}
+
+parse_endpoint() {
+  pe_ep=$1
+  case "$pe_ep" in
+    '['*) die 2 "Endpoint must not be IPv6: only IPv4 endpoints and DNS hostnames are supported" ;;
+  esac
+  case "$pe_ep" in
+    *:*) pe_host=${pe_ep%:*}; pe_port=${pe_ep##*:} ;;
+    *) die 2 "invalid Endpoint: expected host:port" ;;
+  esac
+  case "$pe_host" in
+    *:*) die 2 "Endpoint must not be IPv6: only IPv4 endpoints and DNS hostnames are supported" ;;
+  esac
+  valid_port "$pe_port" || die 2 "invalid Endpoint port: expected 1-65535"
+  if valid_ipv4 "$pe_host"; then
+    ENDPOINT_IS_IP=1
+  else
+    ENDPOINT_IS_IP=0
+    valid_hostname "$pe_host" ||
+      die 2 "invalid Endpoint host: expected an IPv4 literal or a DNS hostname"
+  fi
+  ENDPOINT_HOST=$pe_host
+  ENDPOINT_PORT=$pe_port
+}
+
+validate_exporter_ports() {
+  case "$VPN_EXPORTER_PORTS" in
+    '') die 2 "VPN_EXPORTER_PORTS must list 1-8 ports" ;;
+    *' '*) die 2 "VPN_EXPORTER_PORTS must not contain spaces" ;;
+    ,*|*,|*,,*) die 2 "VPN_EXPORTER_PORTS must list 1-8 comma-separated ports" ;;
+  esac
+  vep_norm=$(printf '%s' "$VPN_EXPORTER_PORTS" | tr ',' ' ')
+  vep_count=0
+  for vep_port in $vep_norm; do
+    valid_port "$vep_port" || die 2 "invalid port in VPN_EXPORTER_PORTS (expected 1-65535)"
+    vep_count=$((vep_count + 1))
+  done
+  if [ "$vep_count" -lt 1 ] || [ "$vep_count" -gt 8 ]; then
+    die 2 "VPN_EXPORTER_PORTS must list 1-8 comma-separated ports"
+  fi
+  return 0
+}
+
+validate_config() {
+  # Runtime identity.
+  case "$VPS_NAME" in
+    '') die 2 "VPS_NAME is required" ;;
+    *[!A-Za-z0-9._-]*) die 2 "VPS_NAME must match [A-Za-z0-9._-]+" ;;
+  esac
+  [ -n "$LOKI_PUSH_URL" ] || die 2 "LOKI_PUSH_URL is required"
+
+  require_uint "$VPN_SUPERVISE_INTERVAL" VPN_SUPERVISE_INTERVAL
+  require_uint "$VPN_HOSTNET_INTERVAL" VPN_HOSTNET_INTERVAL
+  require_uint "$VPN_HANDSHAKE_MAX_AGE" VPN_HANDSHAKE_MAX_AGE
+  valid_prefix "$VPN_ALLOWED_IPV4_MIN_PREFIX" ||
+    die 2 "VPN_ALLOWED_IPV4_MIN_PREFIX must be 0-32"
+  validate_exporter_ports
+  parse_loki_url
+
+  # Keys: 44-character base64 shape (32 bytes). Values are never echoed.
+  valid_key "$V_PrivateKey" ||
+    die 2 "invalid PrivateKey: expected a 44-character base64 key"
+  valid_key "$V_PublicKey" ||
+    die 2 "invalid PublicKey: expected a 44-character base64 key"
+  if [ "$H_PresharedKey" = 1 ]; then
+    valid_key "$V_PresharedKey" ||
+      die 2 "invalid PresharedKey: expected a 44-character base64 key"
+  fi
+
+  if [ "$H_ListenPort" = 1 ]; then
+    valid_port "$V_ListenPort" || die 2 "invalid ListenPort: expected 1-65535"
+    LISTEN_PORT=$V_ListenPort
+  else
+    LISTEN_PORT=''
+  fi
+
+  if [ "$H_MTU" = 1 ]; then
+    case "$V_MTU" in
+      ''|*[!0-9]*) die 2 "invalid MTU: expected a byte count" ;;
+    esac
+    [ "${#V_MTU}" -le 5 ] || die 2 "invalid MTU: expected a byte count"
+    [ "$V_MTU" -ge 68 ] && [ "$V_MTU" -le 65535 ] ||
+      die 2 "invalid MTU: expected 68-65535"
+    MTU=$V_MTU
+  else
+    MTU=1420
+  fi
+
+  if [ "$H_FwMark" = 1 ]; then
+    case "$V_FwMark" in
+      ''|*[!0-9a-fA-Fx]*) die 2 "invalid FwMark: expected a numeric mark" ;;
+    esac
+    FWMARK=$V_FwMark
+  else
+    FWMARK=''
+  fi
+
+  if [ "$H_PersistentKeepalive" = 1 ]; then
+    case "$V_PersistentKeepalive" in
+      ''|*[!0-9]*) die 2 "invalid PersistentKeepalive: expected seconds (0-65535)" ;;
+    esac
+    [ "${#V_PersistentKeepalive}" -le 5 ] ||
+      die 2 "invalid PersistentKeepalive: expected seconds (0-65535)"
+    [ "$V_PersistentKeepalive" -le 65535 ] ||
+      die 2 "invalid PersistentKeepalive: expected seconds (0-65535)"
+    KEEPALIVE=$V_PersistentKeepalive
+  else
+    KEEPALIVE=''
+  fi
+
+  parse_peer_address "$V_Address"
+  parse_allowed_ips "$V_AllowedIPs"
+  ALLOWED_CSV=$(join_csv "$ALLOWED_ROUTES")
+
+  # The Loki push host must be reachable through the tunnel.
+  vc_covered=0
+  for vc_route in $ALLOWED_ROUTES; do
+    if cidr_contains "$vc_route" "$HUB_IP"; then
+      vc_covered=1
+      break
+    fi
+  done
+  [ "$vc_covered" = 1 ] ||
+    die 2 "loki push host $HUB_IP is not covered by AllowedIPs ($ALLOWED_CSV): monitoring traffic would leave the tunnel"
+
+  parse_endpoint "$V_Endpoint"
+
+  if [ -n "$VPN_ENDPOINT_IP" ]; then
+    valid_ipv4 "$VPN_ENDPOINT_IP" ||
+      die 2 "VPN_ENDPOINT_IP must be an IPv4 address"
+    if [ "$ENDPOINT_IS_IP" = 1 ] && [ "$VPN_ENDPOINT_IP" != "$ENDPOINT_HOST" ]; then
+      die 2 "ambiguous endpoint: VPN_ENDPOINT_IP differs from the IPv4 Endpoint in the configuration"
+    fi
+  fi
+
+  # DNS is validated for shape only: it is never applied inside the namespace.
+  DNS_CSV=''
+  if [ "$H_DNS" = 1 ]; then
+    vc_dns_norm=$(printf '%s' "$V_DNS" | tr ',' ' ')
+    for vc_dns in $vc_dns_norm; do
+      case "$vc_dns" in
+        ''|*[!A-Za-z0-9:._-]*) die 2 "invalid DNS entry: expected an IP-like token" ;;
+      esac
+    done
+    DNS_CSV=$(join_csv "$vc_dns_norm")
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+print_summary() {
+  printf 'vpnctl %s: configuration ok\n' "$VPNCTL_VERSION"
+  printf '  interface: %s\n' "$VPN_WG_IFACE"
+  printf '  peer address: %s/32 (supplied %s/%s)\n' "$PEER_ADDR" "$PEER_ADDR" "$PEER_PREFIX"
+  printf '  hub (loki) address: %s\n' "$HUB_IP"
+  printf '  loki push: %s (tcp/%s)\n' "$LOKI_PUSH_URL" "$LOKI_PORT"
+  printf '  exporter ports: %s\n' "$VPN_EXPORTER_PORTS"
+  if [ -n "$VPN_ENDPOINT_IP" ]; then
+    printf '  endpoint: %s:%s (VPN_ENDPOINT_IP override)\n' "$VPN_ENDPOINT_IP" "$ENDPOINT_PORT"
+  elif [ "$ENDPOINT_IS_IP" = 1 ]; then
+    printf '  endpoint: %s:%s\n' "$ENDPOINT_HOST" "$ENDPOINT_PORT"
+  else
+    printf '  endpoint: %s:%s (resolve at startup)\n' "$ENDPOINT_HOST" "$ENDPOINT_PORT"
+  fi
+  if [ -n "$KEEPALIVE" ]; then
+    printf '  persistent keepalive: %s\n' "$KEEPALIVE"
+  fi
+  printf '  allowed routes: %s\n' "$ALLOWED_CSV"
+  if [ -n "$DNS_CSV" ]; then
+    printf '  dns: %s (ignored: no resolver inside the isolated namespace)\n' "$DNS_CSV"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Traffic guard. Only the built-in filter chains of this namespace are used.
+# ---------------------------------------------------------------------------
+cmd_check_config() {
+  resolve_config
+  parse_config <"$CONF_SRC"
+  validate_config
+  print_summary
+  exit 0
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+cmd=${1:-}
+if [ "$#" -gt 0 ]; then
+  shift
+fi
+if [ "$#" -gt 0 ]; then
+  usage >&2
+  exit 2
+fi
+
+case "$cmd" in
+  check-config) cmd_check_config ;;
+  -h|--help|help) usage; exit 0 ;;
+  *) usage >&2; exit 2 ;;
+esac
