@@ -1053,12 +1053,30 @@ cleanup_files() {
   fi
 }
 
+# Closes the namespace when startup fails before the guard is in place: a reset
+# guard is open until guard_apply rebuilds it.
+close_guard_on_failure() {
+  iptables -P INPUT DROP 2>/dev/null || true
+  iptables -P OUTPUT DROP 2>/dev/null || true
+  iptables -P FORWARD DROP 2>/dev/null || true
+  guard_ipv6_drop >/dev/null 2>&1 || true
+}
+
+restore_default_route() {
+  if [ "${DEFAULT_ROUTE_DELETED}" = 1 ] && [ -n "${GW:-}" ] && [ -n "${EGRESS_IF:-}" ]; then
+    if ip route replace default via "$GW" dev "$EGRESS_IF" >/dev/null 2>&1; then
+      DEFAULT_ROUTE_DELETED=0
+    else
+      log "could not restore the default route; the traffic guard still blocks egress"
+    fi
+  fi
+  return 0
+}
+
 runtime_fail() {
   log "$1"
-  if [ "${DEFAULT_ROUTE_DELETED}" = 1 ] && [ -n "${GW:-}" ] && [ -n "${EGRESS_IF:-}" ]; then
-    ip route replace default via "$GW" dev "$EGRESS_IF" >/dev/null 2>&1 ||
-      log "could not restore the default route; the traffic guard still blocks egress"
-  fi
+  close_guard_on_failure
+  restore_default_route
   cleanup_files
   exit 1
 }
@@ -1075,7 +1093,7 @@ cmd_up() {
 
   print_summary
   # From here on any failure removes the runtime files (and any decoded copy).
-  trap 'cleanup_files; exit 0' TERM INT
+  trap 'restore_default_route; cleanup_files; exit 0' TERM INT
 
   # A previous failed start in this namespace may have left a half-built guard
   # (DROP policies without the allow set); reset it before endpoint resolution.

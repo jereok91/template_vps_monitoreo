@@ -627,6 +627,11 @@ if [ -e "${WORK}/run/ready" ]; then
 else
   ok "TERM removes the readiness marker and the runtime config"
 fi
+if grep -q '^default ' "${WORK}/state/routes" 2>/dev/null; then
+  ok "TERM restores the default route for a same-namespace restart"
+else
+  bad "TERM left the namespace without a default route"
+fi
 
 # ---------------------------------------------------------------------------
 # 4. Failure injection: no readiness on any setup failure.
@@ -652,6 +657,16 @@ expect_up_fails() {
     bad "${exp_label} must not publish readiness"
   else
     ok "${exp_label} publishes no readiness marker"
+  fi
+  v4_open=0
+  for exp_chain in INPUT OUTPUT FORWARD; do
+    exp_pol=$(awk -v c="${exp_chain}" '$1 == "-P" && $2 == c { print $3 }' "${WORK}/state/iptables" 2>/dev/null | tail -1)
+    [ "${exp_pol}" = "DROP" ] || v4_open=1
+  done
+  if [ "${v4_open}" = 0 ]; then
+    ok "${exp_label} leaves the IPv4 filter closed"
+  else
+    bad "${exp_label} left the IPv4 filter open"
   fi
 }
 
