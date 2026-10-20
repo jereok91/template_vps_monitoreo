@@ -1,26 +1,148 @@
+# Monitoring collector stack for one VPS, with its own isolated WireGuard client.
+#
+# Network model (see docs/vpn-dokploy.md for the full operator sequence):
+#   * `vpn` owns the only network namespace that has wg0. It is attached to one
+#     dedicated bridge (`vpn_egress`) purely so WireGuard can reach the hub's
+#     public UDP endpoint; that bridge is not the isolation mechanism.
+#   * node_exporter, cadvisor and alloy join that namespace with
+#     `network_mode: "service:vpn"`. They have no Docker network of their own, no
+#     published ports and no route to the internet except the tunnel.
+#   * Isolation is enforced inside the namespace by files/vpnctl: default-DROP
+#     iptables policies, an explicit allow-list for Loki pushes and Prometheus
+#     scrapes, and removal of the default route once the hub endpoint is pinned.
+#
+# Nothing here publishes an exporter port, mounts the host network namespace or
+# touches host routes, DNS, sysctls or firewall rules.
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
-  # 1. Monitorea el Servidor (CPU/RAM/Disco del VPS)
+  # 0. WireGuard client. Own network namespace + socket, NET_ADMIN only.
+  vpn:
+    # Pinned on purpose (same tag the central hub runs). Bump deliberately after
+    # reading the linuxserver/wireguard release notes and the client-mode docs.
+    image: lscr.io/linuxserver/wireguard:1.0.20260223-r0-ls126
+    container_name: vpn
+    restart: unless-stopped
+    # The image's documented client-mode path for a client configuration. It is
+    # mounted read-only from the Dokploy File Mount (../files on a Dokploy host).
+    # vpnctl reads it, validates it and copies only a sanitized setconf.
+    entrypoint: ["/bin/sh", "/opt/vpn/vpnctl"]
+    command: ["up"]
+    # NET_ADMIN is the only capability the tunnel, routes and in-namespace
+    # iptables guard need. No SYS_MODULE (the host kernel provides wireguard), no
+    # privileged, no Docker socket.
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+    security_opt:
+      - no-new-privileges:true
+    # Dedicated bridge, attached to this service only: the path WireGuard uses to
+    # reach the central public UDP endpoint. Never the Dokploy network.
+    networks:
+      - vpn_egress
+    environment:
+      VPS_NAME: ${VPS_NAME:?Set VPS_NAME}
+      # Must be the hub tunnel address (for example http://10.77.0.1:3100/loki/api/v1/push).
+      # vpnctl refuses a public/hostname endpoint so logs cannot leave un-tunnelled.
+      LOKI_PUSH_URL: ${LOKI_PUSH_URL:?Set LOKI_PUSH_URL}
+      # Optional: only for a client config whose Endpoint is a DNS name when the
+      # operator wants no resolution step at all. Never a secret.
+      VPN_ENDPOINT_IP: ${VPN_ENDPOINT_IP:-}
+      VPN_EXPORTER_PORTS: ${VPN_EXPORTER_PORTS:-9100,8080}
+      VPN_HANDSHAKE_MAX_AGE: ${VPN_HANDSHAKE_MAX_AGE:-180}
+      VPN_SUPERVISE_INTERVAL: ${VPN_SUPERVISE_INTERVAL:-10}
+      # Environment fallback (NOT the documented default). base64 is NOT
+      # encryption: `docker inspect` shows it to any local Docker administrator.
+      WG_CONFIG_BASE64: ${WG_CONFIG_BASE64:-}
+    volumes:
+      # Repository / plain `docker compose`: ./files/...
+      # Dokploy: change every ./files/ to ../files/ (Dokploy keeps durable files
+      # one level above the compose directory). Same rule as config.alloy.
+      - ./files/vpnctl:/opt/vpn/vpnctl:ro
+      - ./files/wg0.conf:/config/wg0.conf:ro
+      # Read-only host procfs: vpnctl reads /host/proc/1/net/dev so host NIC
+      # counters are measured in the host network namespace, not in this one.
+      - /proc:/host/proc:ro
+      # Host NIC counters for node_exporter's textfile collector.
+      - node_exporter_textfile:/var/lib/node_exporter/textfile
+    tmpfs:
+      # Runtime secrets and the readiness marker live in memory only.
+      - /run/vpn:mode=0700,size=1m
+    healthcheck:
+      # Readiness only: interface, address, hub route and guard. A handshake is a
+      # separate claim (`docker exec vpn /bin/sh /opt/vpn/vpnctl verify`).
+      test: ["CMD", "/bin/sh", "/opt/vpn/vpnctl", "healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging: *default-logging
+
+  # 1. Host metrics (CPU/RAM/disk/filesystem). Network counters are pinned below.
   node_exporter:
     image: prom/node-exporter:v1.10.2
     container_name: node_exporter
     restart: unless-stopped
+    network_mode: "service:vpn"
+    depends_on:
+      vpn:
+        condition: service_healthy
     volumes:
       - /proc:/host/proc:ro
       - /sys:/host/sys:ro
       - /:/rootfs:ro
+      # Written by vpnctl (host NIC counters), read-only here.
+      - node_exporter_textfile:/var/lib/node_exporter/textfile:ro
     command:
       - "--path.procfs=/host/proc"
       - "--path.rootfs=/rootfs"
       - "--path.sysfs=/host/sys"
       - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
-    ports:
-      - 9100:9100
+      # Inside the shared namespace this listens on wg0 only in practice; the
+      # guard additionally restricts the source to the hub tunnel address.
+      - "--web.listen-address=0.0.0.0:9100"
+      - "--collector.textfile.directory=/var/lib/node_exporter/textfile"
+      # Every collector that reads network-namespace-scoped state (sysfs net,
+      # /proc/net, netlink net) would report lo/wg0 as if they were host NICs.
+      # They are disabled; host NIC counters come from the textfile collector.
+      - "--no-collector.arp"
+      - "--no-collector.bonding"
+      - "--no-collector.conntrack"
+      - "--no-collector.ethtool"
+      - "--no-collector.infiniband"
+      - "--no-collector.ipvs"
+      - "--no-collector.lnstat"
+      - "--no-collector.netclass"
+      - "--no-collector.netdev"
+      - "--no-collector.netstat"
+      - "--no-collector.network_route"
+      - "--no-collector.nfs"
+      - "--no-collector.nfsd"
+      - "--no-collector.qdisc"
+      - "--no-collector.sockstat"
+      - "--no-collector.softnet"
+      - "--no-collector.tcpstat"
+      - "--no-collector.udp_queues"
+      - "--no-collector.wifi"
+      - "--no-collector.xfrm"
+    logging: *default-logging
 
-  # 2. Monitorea los Contenedores Docker (Consumo por App)
+  # 2. Container metrics. Its existing host access is retained unchanged; this is
+  #    network scoping, not a security boundary against a compromised cAdvisor.
   cadvisor:
     image: gcr.io/cadvisor/cadvisor:v0.52.0
     container_name: cadvisor
     restart: unless-stopped
+    network_mode: "service:vpn"
+    depends_on:
+      vpn:
+        condition: service_healthy
     privileged: true
     devices:
       - /dev/kmsg
@@ -30,15 +152,22 @@ services:
       - /sys:/sys:ro
       - /var/lib/docker/:/var/lib/docker:ro
       - /dev/disk/:/dev/disk:ro
-    ports:
-      - 8080:8080
+    command:
+      # Reachable through the tunnel only: the namespace has no other interface.
+      - "--listen_ip=0.0.0.0"
+      - "--port=8080"
+    logging: *default-logging
 
-  # 3. Envía los access logs de Traefik a un Loki central
+  # 3. Traefik access logs -> central Loki over the tunnel.
   alloy:
     image: grafana/alloy:v1.20.1
     container_name: alloy
     restart: unless-stopped
-    # UID/GID 473 es el usuario `alloy` dentro de la imagen.
+    network_mode: "service:vpn"
+    depends_on:
+      vpn:
+        condition: service_healthy
+    # UID/GID 473 is the `alloy` user inside the image.
     user: "473:473"
     environment:
       VPS_NAME: ${VPS_NAME:?Set VPS_NAME}
@@ -49,21 +178,25 @@ services:
       - /etc/alloy/config.alloy
     volumes:
       # Repo / `docker compose` local: ./files/config.alloy
-      # Dokploy: cambiar a ../files/config.alloy (el compose vive en <app>/code/)
+      # Dokploy: ../files/config.alloy (the compose lives in <app>/code/)
       - ./files/config.alloy:/etc/alloy/config.alloy:ro
-      # Dokploy escribe el access log acá. En un VPS sin Dokploy, apuntá
-      # esto al directorio real donde Traefik deja sus logs.
+      # Dokploy writes the Traefik access log here. Read-only, never modified.
       - /etc/dokploy/traefik/dynamic:/var/log/traefik:ro
       - alloy_data:/var/lib/alloy/data
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *default-logging
 
 volumes:
+  # Alloy read positions/data: survives restarts and redeploys.
   alloy_data:
+  # Host NIC counters written by vpnctl and read by node_exporter.
+  node_exporter_textfile:
+
+networks:
+  # Dedicated egress bridge for the VPN service only. Unrelated Dokploy
+  # applications live on their own networks and never join this one.
+  vpn_egress:
+    driver: bridge

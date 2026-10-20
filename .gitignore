@@ -1,1 +1,3 @@
 .env
+# Real WireGuard client configuration (private key). Never commit it.
+files/wg0.conf
