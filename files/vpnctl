@@ -23,8 +23,13 @@
 #
 # Subcommands:
 #   check-config   validate the configuration and print the resolved plan
+#   up             build the tunnel, apply the guard, publish readiness, supervise
+#   healthcheck    readiness only (Docker healthcheck)
+#   status         readiness plus handshake age and transfer totals
+#   verify         connectivity: a handshake exists and is recent enough
+#   hostnet-loop   host NIC counters for node_exporter's textfile collector
 #
-# Usage: vpnctl [-h|--help] [check-config]
+# Usage: vpnctl [-h|--help] [check-config|up|healthcheck|status|verify|hostnet-loop]
 
 set -u
 
@@ -74,6 +79,7 @@ DECODED_FILE=''
 HOSTNET_PID=''
 HOSTNET_SLEEP_PID=''
 SUPERVISE_SLEEP_PID=''
+DEFAULT_ROUTE_DELETED=0
 
 # ---------------------------------------------------------------------------
 # Messages
@@ -98,6 +104,13 @@ Usage: vpnctl [SUBCOMMAND]
 Subcommands:
   check-config    Validate the client configuration and print the resolved plan.
                   Pure: no ip/wg/iptables call, no write outside VPN_RUN_DIR.
+  up              Validate, create the interface, routes and traffic guard,
+                  write the readiness marker, then supervise (default).
+  healthcheck     Readiness only: marker, interface, address, hub route, guard.
+                  Exit 0 when ready, 1 otherwise.
+  status          Readiness plus hub/endpoint, handshake age and transfer totals.
+  verify          Connectivity: exit 0 only for a recent handshake.
+  hostnet-loop    Emit host NIC counters to the node_exporter textfile collector.
   -h, --help      Show this help.
 
 Environment:
@@ -734,6 +747,273 @@ print_summary() {
 # ---------------------------------------------------------------------------
 # Traffic guard. Only the built-in filter chains of this namespace are used.
 # ---------------------------------------------------------------------------
+guard_policies_drop() {
+  for gpd_chain in INPUT OUTPUT FORWARD; do
+    gpd_line=$(iptables -S "$gpd_chain" 2>/dev/null | awk 'NR == 1 { print; exit }')
+    [ "$gpd_line" = "-P $gpd_chain DROP" ] || return 1
+  done
+  return 0
+}
+
+# The tunnel is IPv4-only. IPv6 is locked down completely: a namespace that
+# happens to get an IPv6 address must not become a public egress path that
+# bypasses the IPv4 guard.
+guard_ipv6_drop() {
+  command -v ip6tables >/dev/null 2>&1 || return 1
+  ip6tables -F INPUT 2>/dev/null || return 1
+  ip6tables -F OUTPUT 2>/dev/null || return 1
+  ip6tables -F FORWARD 2>/dev/null || return 1
+  ip6tables -P INPUT DROP 2>/dev/null || return 1
+  ip6tables -P OUTPUT DROP 2>/dev/null || return 1
+  ip6tables -P FORWARD DROP 2>/dev/null || return 1
+  ip6tables -A INPUT -i lo -j ACCEPT 2>/dev/null || return 1
+  ip6tables -A OUTPUT -o lo -j ACCEPT 2>/dev/null || return 1
+  return 0
+}
+
+guard_ipv6_verify() {
+  command -v ip6tables >/dev/null 2>&1 || return 1
+  for gv_chain in INPUT OUTPUT FORWARD; do
+    gv_line=$(ip6tables -S "$gv_chain" 2>/dev/null | awk 'NR == 1 { print; exit }')
+    [ "$gv_line" = "-P $gv_chain DROP" ] || return 1
+  done
+  ip6tables -C INPUT -i lo -j ACCEPT 2>/dev/null || return 1
+  ip6tables -C OUTPUT -o lo -j ACCEPT 2>/dev/null || return 1
+  return 0
+}
+
+# A failed start in the same namespace can leave DROP policies without the full
+# allow set, which would block the endpoint resolution this start depends on.
+guard_reset() {
+  guard_ipv6_drop >/dev/null 2>&1 || true
+  for gr_chain in INPUT OUTPUT FORWARD; do
+    iptables -F "$gr_chain" 2>/dev/null || true
+    iptables -P "$gr_chain" ACCEPT 2>/dev/null || true
+  done
+  return 0
+}
+
+guard_apply() {
+  iptables -F INPUT 2>/dev/null || return 1
+  iptables -F OUTPUT 2>/dev/null || return 1
+  iptables -F FORWARD 2>/dev/null || return 1
+  iptables -P INPUT DROP 2>/dev/null || return 1
+  iptables -P OUTPUT DROP 2>/dev/null || return 1
+  iptables -P FORWARD DROP 2>/dev/null || return 1
+  iptables -A INPUT -i lo -j ACCEPT 2>/dev/null || return 1
+  iptables -A OUTPUT -o lo -j ACCEPT 2>/dev/null || return 1
+  iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || return 1
+  iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || return 1
+  iptables -A OUTPUT -o "$VPN_WG_IFACE" -d "$HUB_IP" -p tcp --dport "$LOKI_PORT" -j ACCEPT 2>/dev/null || return 1
+  iptables -A OUTPUT -o "$VPN_WG_IFACE" -d "$HUB_IP" -p icmp --icmp-type echo-request -j ACCEPT 2>/dev/null || return 1
+  iptables -A INPUT -i "$VPN_WG_IFACE" -s "$HUB_IP" -p tcp -m multiport --dports "$VPN_EXPORTER_PORTS" -j ACCEPT 2>/dev/null || return 1
+  iptables -A INPUT -i "$VPN_WG_IFACE" -s "$HUB_IP" -p icmp --icmp-type echo-request -j ACCEPT 2>/dev/null || return 1
+  iptables -A OUTPUT -o "$EGRESS_IF" -d "$ENDPOINT_IP" -p udp --dport "$ENDPOINT_PORT" -j ACCEPT 2>/dev/null || return 1
+  iptables -A INPUT -i "$EGRESS_IF" -s "$ENDPOINT_IP" -p udp -j ACCEPT 2>/dev/null || return 1
+  guard_ipv6_drop || return 1
+  return 0
+}
+
+# Verifies the complete guard (both families, every allow rule). The healthcheck
+# passes the values frozen in the readiness marker, so it checks the live guard
+# against what was published, not against a config file that may have changed.
+guard_verify_for() { # iface hub loki_port ports egress endpoint_ip endpoint_port
+  gvf_iface=$1
+  gvf_hub=$2
+  gvf_lport=$3
+  gvf_ports=$4
+  gvf_egress=$5
+  gvf_eip=$6
+  gvf_eport=$7
+  guard_policies_drop || return 1
+  guard_ipv6_verify || return 1
+  iptables -C INPUT -i lo -j ACCEPT 2>/dev/null || return 1
+  iptables -C OUTPUT -o lo -j ACCEPT 2>/dev/null || return 1
+  iptables -C INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || return 1
+  iptables -C OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || return 1
+  iptables -C OUTPUT -o "$gvf_iface" -d "$gvf_hub" -p tcp --dport "$gvf_lport" -j ACCEPT 2>/dev/null || return 1
+  iptables -C OUTPUT -o "$gvf_iface" -d "$gvf_hub" -p icmp --icmp-type echo-request -j ACCEPT 2>/dev/null || return 1
+  iptables -C INPUT -i "$gvf_iface" -s "$gvf_hub" -p tcp -m multiport --dports "$gvf_ports" -j ACCEPT 2>/dev/null || return 1
+  iptables -C INPUT -i "$gvf_iface" -s "$gvf_hub" -p icmp --icmp-type echo-request -j ACCEPT 2>/dev/null || return 1
+  iptables -C OUTPUT -o "$gvf_egress" -d "$gvf_eip" -p udp --dport "$gvf_eport" -j ACCEPT 2>/dev/null || return 1
+  iptables -C INPUT -i "$gvf_egress" -s "$gvf_eip" -p udp -j ACCEPT 2>/dev/null || return 1
+  return 0
+}
+
+guard_verify() {
+  guard_verify_for "$VPN_WG_IFACE" "$HUB_IP" "$LOKI_PORT" "$VPN_EXPORTER_PORTS" \
+    "$EGRESS_IF" "$ENDPOINT_IP" "$ENDPOINT_PORT"
+}
+
+# ---------------------------------------------------------------------------
+# Sanitized wg setconf input: interface address/DNS/MTU never reach `wg`.
+# ---------------------------------------------------------------------------
+write_setconf() {
+  ws_endpoint=$1
+  (umask 077; {
+    printf '[Interface]\n'
+    printf 'PrivateKey = %s\n' "$V_PrivateKey"
+    if [ -n "$LISTEN_PORT" ]; then
+      printf 'ListenPort = %s\n' "$LISTEN_PORT"
+    fi
+    if [ -n "$FWMARK" ]; then
+      printf 'FwMark = %s\n' "$FWMARK"
+    fi
+    printf '\n[Peer]\n'
+    printf 'PublicKey = %s\n' "$V_PublicKey"
+    if [ -n "$V_PresharedKey" ]; then
+      printf 'PresharedKey = %s\n' "$V_PresharedKey"
+    fi
+    printf 'AllowedIPs = %s\n' "$ALLOWED_CSV"
+    printf 'Endpoint = %s\n' "$ws_endpoint"
+    if [ -n "$KEEPALIVE" ]; then
+      printf 'PersistentKeepalive = %s\n' "$KEEPALIVE"
+    fi
+  } >"$SETCONF_FILE") || return 1
+  chmod 600 "$SETCONF_FILE" 2>/dev/null || true
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Readiness marker
+# ---------------------------------------------------------------------------
+write_ready() {
+  wr_tmp="${READY_FILE}.$$"
+  (umask 077; {
+    printf 'version=%s\n' "$VPNCTL_VERSION"
+    printf 'iface=%s\n' "$VPN_WG_IFACE"
+    printf 'addr=%s/32\n' "$PEER_ADDR"
+    printf 'hub=%s\n' "$HUB_IP"
+    printf 'loki_port=%s\n' "$LOKI_PORT"
+    printf 'exporter_ports=%s\n' "$VPN_EXPORTER_PORTS"
+    printf 'endpoint_ip=%s\n' "$ENDPOINT_IP"
+    printf 'endpoint_port=%s\n' "$ENDPOINT_PORT"
+    printf 'egress_if=%s\n' "$EGRESS_IF"
+    printf 'gateway=%s\n' "$GW"
+    printf 'mtu=%s\n' "$MTU"
+    printf 'allowed_ips=%s\n' "$ALLOWED_CSV"
+    printf 'keepalive=%s\n' "${KEEPALIVE:-0}"
+    printf 'written_at=%s\n' "$(date +%s)"
+  } >"$wr_tmp") || return 1
+  chmod 600 "$wr_tmp" 2>/dev/null || true
+  mv -f "$wr_tmp" "$READY_FILE" || return 1
+  return 0
+}
+
+marker_value() {
+  [ -f "$READY_FILE" ] || return 0
+  awk -v key="$1" 'index($0, key "=") == 1 { sub(/^[^=]*=/, ""); print; exit }' "$READY_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# Handshake helpers (never print key material)
+# ---------------------------------------------------------------------------
+handshake_epoch() {
+  he_val=$(wg show "$VPN_WG_IFACE" latest-handshakes 2>/dev/null | awk 'NR == 1 { print $2 }')
+  case "$he_val" in
+    ''|*[!0-9]*) printf '0' ;;
+    *) printf '%s' "$he_val" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# hostnet-loop: host NIC counters for node_exporter's textfile collector
+# ---------------------------------------------------------------------------
+emit_hostnet() {
+  eh_src="${VPN_HOST_PROC}/1/net/dev"
+  eh_dir=$VPN_TEXTFILE_DIR
+  mkdir -p "$eh_dir" 2>/dev/null || return 1
+  chmod 755 "$eh_dir" 2>/dev/null || true
+  eh_tmp="${eh_dir}/.hostnet.prom.$$"
+  eh_now=$(date +%s)
+  eh_avail=0
+  if [ -f "$eh_src" ] && [ -r "$eh_src" ]; then
+    eh_avail=1
+  fi
+  (umask 022; {
+    printf '# HELP hostnet_metrics_available 1 when host NIC counters were read from the host network namespace.\n'
+    printf '# TYPE hostnet_metrics_available gauge\n'
+    printf 'hostnet_metrics_available %s\n' "$eh_avail"
+    printf '# HELP hostnet_last_read_timestamp_seconds Unix time of the last host NIC read attempt.\n'
+    printf '# TYPE hostnet_last_read_timestamp_seconds gauge\n'
+    printf 'hostnet_last_read_timestamp_seconds %s\n' "$eh_now"
+    if [ "$eh_avail" = 1 ]; then
+      awk '
+        BEGIN {
+          names_n = split("node_network_receive_bytes_total node_network_receive_packets_total node_network_receive_errs_total node_network_receive_drop_total node_network_receive_fifo_total node_network_receive_frame_total node_network_receive_compressed_total node_network_receive_multicast_total node_network_transmit_bytes_total node_network_transmit_packets_total node_network_transmit_errs_total node_network_transmit_drop_total node_network_transmit_fifo_total node_network_transmit_colls_total node_network_transmit_carrier_total node_network_transmit_compressed_total", names, " ")
+          devcount = 0
+        }
+        {
+          parts_n = split($0, parts, ":")
+          if (parts_n < 2) next
+          dev = parts[1]
+          for (i = 2; i < parts_n; i++) dev = dev ":" parts[i]
+          gsub(/^[ \t]+/, "", dev)
+          gsub(/[ \t]+$/, "", dev)
+          if (dev !~ /^[A-Za-z0-9_.:-]+$/) next
+          vals_n = split(parts[parts_n], raw, /[ \t]+/)
+          count = 0
+          ok = 1
+          for (i = 1; i <= vals_n; i++) {
+            if (raw[i] == "") continue
+            if (raw[i] !~ /^[0-9]+$/) { ok = 0; break }
+            count++
+            vals[count] = raw[i]
+          }
+          if (!ok || count != 16) next
+          devcount++
+          devs[devcount] = dev
+          for (i = 1; i <= 16; i++) data[dev, i] = vals[i]
+        }
+        END {
+          for (k = 1; k <= 16; k++) {
+            printed = 0
+            for (j = 1; j <= devcount; j++) {
+              if (data[devs[j], k] == "") continue
+              if (!printed) {
+                print "# HELP " names[k] " Host NIC counter read from /proc/1/net/dev of the host network namespace."
+                print "# TYPE " names[k] " counter"
+                printed = 1
+              }
+              printf "%s{device=\"%s\",source=\"hostnet\"} %s\n", names[k], devs[j], data[devs[j], k]
+            }
+          }
+        }
+      ' "$eh_src" 2>/dev/null
+    fi
+  } >"$eh_tmp") || {
+    rm -f "$eh_tmp" 2>/dev/null
+    return 1
+  }
+  chmod 644 "$eh_tmp" 2>/dev/null || true
+  mv -f "$eh_tmp" "${eh_dir}/hostnet.prom" || {
+    rm -f "$eh_tmp" 2>/dev/null
+    return 1
+  }
+  return 0
+}
+
+cmd_hostnet_loop() {
+  case "$VPN_HOSTNET_INTERVAL" in
+    ''|*[!0-9]*|0*) die 2 "VPN_HOSTNET_INTERVAL must be a positive integer" ;;
+  esac
+  # A backgrounded sleep keeps the loop responsive to TERM and leaves no child behind.
+  trap 'kill ${HOSTNET_SLEEP_PID:-} 2>/dev/null; exit 0' TERM INT
+  while :; do
+    emit_hostnet || log "cannot write ${VPN_TEXTFILE_DIR}/hostnet.prom"
+    if [ "$VPN_HOSTNET_ONCE" = 1 ]; then
+      exit 0
+    fi
+    sleep "$VPN_HOSTNET_INTERVAL" &
+    HOSTNET_SLEEP_PID=$!
+    wait "$HOSTNET_SLEEP_PID" 2>/dev/null || true
+    HOSTNET_SLEEP_PID=''
+  done
+}
+
+# ---------------------------------------------------------------------------
+# check-config
+# ---------------------------------------------------------------------------
 cmd_check_config() {
   resolve_config
   parse_config <"$CONF_SRC"
@@ -743,10 +1023,293 @@ cmd_check_config() {
 }
 
 # ---------------------------------------------------------------------------
+# up
+# ---------------------------------------------------------------------------
+stop_hostnet() {
+  if [ -n "$HOSTNET_PID" ]; then
+    kill "$HOSTNET_PID" 2>/dev/null || true
+    HOSTNET_PID=''
+  fi
+}
+
+stop_sleep() {
+  if [ -n "$SUPERVISE_SLEEP_PID" ]; then
+    kill "$SUPERVISE_SLEEP_PID" 2>/dev/null || true
+    SUPERVISE_SLEEP_PID=''
+  fi
+}
+
+spawn_hostnet() {
+  VPN_HOSTNET_ONCE=0 "$SELF_SHELL" "$SELF" hostnet-loop &
+  HOSTNET_PID=$!
+}
+
+cleanup_files() {
+  stop_sleep
+  stop_hostnet
+  rm -f "$READY_FILE" "$SETCONF_FILE" 2>/dev/null || true
+  if [ -n "$DECODED_FILE" ]; then
+    rm -f "$DECODED_FILE" 2>/dev/null || true
+  fi
+}
+
+runtime_fail() {
+  log "$1"
+  if [ "${DEFAULT_ROUTE_DELETED}" = 1 ] && [ -n "${GW:-}" ] && [ -n "${EGRESS_IF:-}" ]; then
+    ip route replace default via "$GW" dev "$EGRESS_IF" >/dev/null 2>&1 ||
+      log "could not restore the default route; the traffic guard still blocks egress"
+  fi
+  cleanup_files
+  exit 1
+}
+
+cmd_up() {
+  resolve_config
+  parse_config <"$CONF_SRC"
+  validate_config
+
+  umask 077
+  mkdir -p "$VPN_RUN_DIR" 2>/dev/null ||
+    die 1 "cannot create the runtime directory $VPN_RUN_DIR"
+  chmod 700 "$VPN_RUN_DIR" 2>/dev/null || true
+
+  print_summary
+  # From here on any failure removes the runtime files (and any decoded copy).
+  trap 'cleanup_files; exit 0' TERM INT
+
+  # A previous failed start in this namespace may have left a half-built guard
+  # (DROP policies without the allow set); reset it before endpoint resolution.
+  guard_reset
+
+  # 2. Egress discovery.
+  up_default_route=$(ip route show default 2>/dev/null | awk 'NR == 1 { print; exit }')
+  if [ -z "$up_default_route" ]; then
+    runtime_fail "no default route in this network namespace: the WireGuard endpoint is unreachable"
+  fi
+  GW=$(printf '%s\n' "$up_default_route" |
+    awk '{ for (i = 1; i < NF; i++) if ($i == "via") { print $(i + 1); exit } }')
+  EGRESS_IF=$(printf '%s\n' "$up_default_route" |
+    awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
+  valid_ipv4 "$GW" ||
+    runtime_fail "cannot determine the default gateway from 'ip route show default'"
+  case "$EGRESS_IF" in
+    ''|*[!A-Za-z0-9_.:@-]*)
+      runtime_fail "cannot determine the egress interface from 'ip route show default'"
+      ;;
+  esac
+
+  # 3. Recreate the interface (idempotent re-run).
+  if ip link show dev "$VPN_WG_IFACE" >/dev/null 2>&1; then
+    ip link del dev "$VPN_WG_IFACE" >/dev/null 2>&1 ||
+      runtime_fail "cannot remove the existing $VPN_WG_IFACE interface"
+  fi
+  ip link add dev "$VPN_WG_IFACE" type wireguard >/dev/null 2>&1 ||
+    runtime_fail "cannot create $VPN_WG_IFACE: the wireguard kernel module must be loaded and NET_ADMIN granted"
+
+  # 4. Sanitized wg configuration.
+  if [ -n "$VPN_ENDPOINT_IP" ]; then
+    up_endpoint="${VPN_ENDPOINT_IP}:${ENDPOINT_PORT}"
+  else
+    up_endpoint="${ENDPOINT_HOST}:${ENDPOINT_PORT}"
+  fi
+  write_setconf "$up_endpoint" ||
+    runtime_fail "cannot write the sanitized configuration to $SETCONF_FILE"
+  wg setconf "$VPN_WG_IFACE" "$SETCONF_FILE" >/dev/null 2>&1 ||
+    runtime_fail "wg setconf rejected the sanitized configuration for $VPN_WG_IFACE"
+
+  # 5. Read the endpoint back from wg (hostname resolution happened there).
+  up_ep=$(wg show "$VPN_WG_IFACE" endpoints 2>/dev/null | awk 'NR == 1 { print $2 }')
+  if [ -z "$up_ep" ]; then
+    runtime_fail "wg reported no endpoint for $VPN_WG_IFACE: an endpoint hostname may be unresolvable here, set VPN_ENDPOINT_IP to the hub public IPv4 address"
+  fi
+  ENDPOINT_IP=${up_ep%:*}
+  up_port=${up_ep##*:}
+  case "$ENDPOINT_IP" in
+    '['*|*:*) ENDPOINT_IP='' ;;
+  esac
+  if [ -z "$ENDPOINT_IP" ] || ! valid_ipv4 "$ENDPOINT_IP" || ! valid_port "$up_port"; then
+    runtime_fail "cannot parse the endpoint wg resolved for $VPN_WG_IFACE, set VPN_ENDPOINT_IP to the hub public IPv4 address"
+  fi
+  ENDPOINT_PORT=$up_port
+  if [ -n "$VPN_ENDPOINT_IP" ]; then
+    ENDPOINT_IP=$VPN_ENDPOINT_IP
+  fi
+
+  # 6. Address, MTU, link state.
+  ip addr add "$PEER_ADDR/32" dev "$VPN_WG_IFACE" >/dev/null 2>&1 ||
+    runtime_fail "cannot assign $PEER_ADDR/32 to $VPN_WG_IFACE"
+  ip link set dev "$VPN_WG_IFACE" mtu "$MTU" >/dev/null 2>&1 ||
+    runtime_fail "cannot set MTU $MTU on $VPN_WG_IFACE"
+  ip link set dev "$VPN_WG_IFACE" up >/dev/null 2>&1 ||
+    runtime_fail "cannot bring $VPN_WG_IFACE up"
+
+  # 7. Only the AllowedIPs routes: the peer address is a /32 host route.
+  for up_route in $ALLOWED_ROUTES; do
+    ip route replace "$up_route" dev "$VPN_WG_IFACE" >/dev/null 2>&1 ||
+      runtime_fail "cannot route $up_route through $VPN_WG_IFACE"
+  done
+
+  # 8. Guard before readiness.
+  guard_apply ||
+    runtime_fail "cannot install the traffic guard (iptables and NET_ADMIN are required)"
+  guard_verify ||
+    runtime_fail "the traffic guard did not verify after applying it: refusing to report readiness"
+
+  # 9. Lock the egress: endpoint host route first, then drop the default route.
+  ip route replace "$ENDPOINT_IP/32" via "$GW" dev "$EGRESS_IF" >/dev/null 2>&1 ||
+    runtime_fail "cannot pin the endpoint $ENDPOINT_IP to $EGRESS_IF"
+  ip route del default >/dev/null 2>&1 ||
+    runtime_fail "cannot remove the default route: public egress could silently carry monitoring traffic"
+  DEFAULT_ROUTE_DELETED=1
+  if [ -n "$(ip route show default 2>/dev/null)" ]; then
+    runtime_fail "a default route is still present after lockdown: refusing the public fallback"
+  fi
+
+  # 10. Readiness marker last, atomically.
+  write_ready || runtime_fail "cannot write the readiness marker $READY_FILE"
+  log "ready: $VPN_WG_IFACE $PEER_ADDR/32 via $ENDPOINT_IP:$ENDPOINT_PORT ($EGRESS_IF/$GW)"
+
+  # 11. Host metrics loop in the background, supervisor in the foreground.
+  spawn_hostnet
+  while :; do
+    sleep "$VPN_SUPERVISE_INTERVAL" &
+    SUPERVISE_SLEEP_PID=$!
+    wait "$SUPERVISE_SLEEP_PID" 2>/dev/null || true
+    SUPERVISE_SLEEP_PID=''
+    if ! ip link show dev "$VPN_WG_IFACE" >/dev/null 2>&1; then
+      runtime_fail "$VPN_WG_IFACE disappeared: exiting so the container restarts"
+    fi
+    if ! guard_verify; then
+      log "the traffic guard drifted: re-applying"
+      if ! guard_apply || ! guard_verify; then
+        runtime_fail "cannot re-apply the traffic guard: exiting"
+      fi
+    fi
+    if [ -n "$HOSTNET_PID" ] && ! kill -0 "$HOSTNET_PID" 2>/dev/null; then
+      log "hostnet-loop exited: restarting it"
+      HOSTNET_PID=''
+      spawn_hostnet
+    fi
+  done
+}
+
+# ---------------------------------------------------------------------------
+# healthcheck (readiness only, never a handshake)
+# ---------------------------------------------------------------------------
+cmd_healthcheck() {
+  hc_no() {
+    printf 'not ready: %s\n' "$1"
+    exit 1
+  }
+  [ -f "$READY_FILE" ] || hc_no "no readiness marker at $READY_FILE"
+
+  hc_iface=$(marker_value iface)
+  hc_addr=$(marker_value addr)
+  hc_hub=$(marker_value hub)
+  hc_lport=$(marker_value loki_port)
+  hc_ports=$(marker_value exporter_ports)
+  hc_eip=$(marker_value endpoint_ip)
+  hc_eport=$(marker_value endpoint_port)
+  hc_egress=$(marker_value egress_if)
+
+  case "$hc_iface" in
+    ''|*[!A-Za-z0-9_.:@-]*) hc_no "readiness marker has no usable interface" ;;
+  esac
+  valid_ipv4 "$hc_hub" || hc_no "readiness marker has no usable hub address"
+  valid_port "$hc_lport" || hc_no "readiness marker has no usable loki port"
+  case "$hc_addr" in
+    *' '*) hc_no "readiness marker has no usable address" ;;
+  esac
+  case "$hc_addr" in
+    */32) ;;
+    *) hc_no "readiness marker has no usable address" ;;
+  esac
+  case "$hc_ports" in
+    ''|*' '*|*[!0-9,]*) hc_no "readiness marker has no usable exporter ports" ;;
+  esac
+  valid_ipv4 "$hc_eip" || hc_no "readiness marker has no usable endpoint address"
+  valid_port "$hc_eport" || hc_no "readiness marker has no usable endpoint port"
+  case "$hc_egress" in
+    ''|*[!A-Za-z0-9_.:@-]*) hc_no "readiness marker has no usable egress interface" ;;
+  esac
+
+  ip link show dev "$hc_iface" >/dev/null 2>&1 || hc_no "$hc_iface does not exist"
+  ip addr show dev "$hc_iface" 2>/dev/null | grep -F "$hc_addr" >/dev/null 2>&1 ||
+    hc_no "$hc_addr is not assigned to $hc_iface"
+  ip route show dev "$hc_iface" 2>/dev/null | grep -F "$hc_hub" >/dev/null 2>&1 ||
+    hc_no "no route to $hc_hub through $hc_iface"
+  guard_verify_for "$hc_iface" "$hc_hub" "$hc_lport" "$hc_ports" \
+    "$hc_egress" "$hc_eip" "$hc_eport" ||
+    hc_no "the traffic guard is incomplete (policies or an allow rule are missing)"
+
+  printf 'ready: %s %s via %s\n' "$hc_iface" "$hc_addr" "$hc_hub"
+  exit 0
+}
+
+# ---------------------------------------------------------------------------
+# status
+# ---------------------------------------------------------------------------
+cmd_status() {
+  st_ready=0
+  if [ -f "$READY_FILE" ]; then
+    st_ready=1
+  fi
+  if [ "$st_ready" = 1 ]; then
+    printf 'readiness: ready (%s)\n' "$READY_FILE"
+  else
+    printf 'readiness: not ready (no %s)\n' "$READY_FILE"
+  fi
+  st_iface=$(marker_value iface)
+  [ -n "$st_iface" ] || st_iface=$VPN_WG_IFACE
+  st_hub=$(marker_value hub)
+  st_eip=$(marker_value endpoint_ip)
+  st_eport=$(marker_value endpoint_port)
+  printf 'hub: %s\n' "${st_hub:-unknown}"
+  printf 'endpoint: %s:%s\n' "${st_eip:-unknown}" "${st_eport:-unknown}"
+
+  st_now=$(date +%s)
+  st_hs=$(handshake_epoch)
+  if [ "$st_hs" -le 0 ]; then
+    printf 'handshake: never\n'
+  else
+    printf 'handshake age: %ss\n' "$((st_now - st_hs))"
+  fi
+  st_rx=$(wg show "$VPN_WG_IFACE" transfer 2>/dev/null | awk 'NR == 1 { print $2 }')
+  st_tx=$(wg show "$VPN_WG_IFACE" transfer 2>/dev/null | awk 'NR == 1 { print $3 }')
+  case "$st_rx" in ''|*[!0-9]*) st_rx=0 ;; esac
+  case "$st_tx" in ''|*[!0-9]*) st_tx=0 ;; esac
+  printf 'transfer: rx=%s tx=%s\n' "$st_rx" "$st_tx"
+
+  [ "$st_ready" = 1 ] && exit 0
+  exit 1
+}
+
+# ---------------------------------------------------------------------------
+# verify (the only connectivity claim)
+# ---------------------------------------------------------------------------
+cmd_verify() {
+  case "$VPN_HANDSHAKE_MAX_AGE" in
+    ''|*[!0-9]*|0*) die 2 "VPN_HANDSHAKE_MAX_AGE must be a positive integer" ;;
+  esac
+  vf_now=$(date +%s)
+  vf_hs=$(handshake_epoch)
+  if [ "$vf_hs" -le 0 ]; then
+    printf 'connectivity: no handshake with the hub yet (never)\n'
+    exit 1
+  fi
+  vf_age=$((vf_now - vf_hs))
+  if [ "$vf_age" -gt "$VPN_HANDSHAKE_MAX_AGE" ]; then
+    printf 'connectivity: handshake is stale (%ss old, max %ss)\n' "$vf_age" "$VPN_HANDSHAKE_MAX_AGE"
+    exit 1
+  fi
+  printf 'connectivity: handshake ok (%ss old)\n' "$vf_age"
+  exit 0
+}
+
+# ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
-
-cmd=${1:-}
+cmd=${1:-up}
 if [ "$#" -gt 0 ]; then
   shift
 fi
@@ -757,6 +1320,17 @@ fi
 
 case "$cmd" in
   check-config) cmd_check_config ;;
-  -h|--help|help) usage; exit 0 ;;
-  *) usage >&2; exit 2 ;;
+  up) cmd_up ;;
+  healthcheck) cmd_healthcheck ;;
+  status) cmd_status ;;
+  verify) cmd_verify ;;
+  hostnet-loop) cmd_hostnet_loop ;;
+  -h|--help|help)
+    usage
+    exit 0
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
 esac
