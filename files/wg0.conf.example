@@ -1,0 +1,39 @@
+# TEMPLATE ONLY - every value in this file is FAKE.
+#
+# The real file is generated on the CENTRAL VPS for one specific peer:
+#
+#   scripts/vpn/peer.sh show <name>
+#
+# Install that output as the Dokploy File Mount (see docs/vpn-dokploy.md) or as
+# /config/wg0.conf on a plain `docker compose` host. NEVER commit the real file:
+# it contains the peer PRIVATE KEY, and files/wg0.conf is git-ignored for exactly
+# that reason. This example exists so the structure and the validator can be
+# checked without any key material.
+#
+# The three keys below are placeholder filler (43 identical characters plus the
+# trailing '=' of a 44-character base64 value). They are not derived from, and do
+# not match, any real WireGuard key pair.
+
+[Interface]
+# Tunnel address assigned by the central hub for this peer (one address per VPS).
+Address = 10.77.0.2/24
+# FAKE PRIVATE KEY - placeholder filler, not a key.
+PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+# Kept from the generated config: the hub initiates scrapes, so the peer listens.
+ListenPort = 51820
+# Validated for shape only and IGNORED by vpnctl: no resolver is touched inside
+# the isolated namespace (the tunnel is addressed by IP on both ends).
+DNS = 1.1.1.1
+
+[Peer]
+# Public key of the central monitoring VPS (the WireGuard hub). FAKE filler.
+PublicKey = BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=
+# One preshared key per hub/peer pair. FAKE filler.
+PresharedKey = CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=
+# Split routing: only the hub tunnel address enters the tunnel. vpnctl rejects a
+# default route here, so monitoring traffic can never be tunnelled wholesale.
+AllowedIPs = 10.77.0.1/32
+# Central public IPv4 from WG_SERVERURL on the public UDP port (documentation range).
+Endpoint = 203.0.113.10:51820
+# Keeps the NAT mapping on this side alive so the hub can reach the exporters.
+PersistentKeepalive = 25

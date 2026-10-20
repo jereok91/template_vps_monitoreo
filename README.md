@@ -1,263 +1,263 @@
 # VPS Monitoring (Docker Compose)
 
-This repository provides a minimal **Docker Compose** setup to monitor a VPS host, its Docker containers, and the Traefik access log that Dokploy writes.
+Collector bundle for one VPS: host metrics, container metrics and the Traefik access
+log, shipped to a central Prometheus/Grafana/Loki stack. All three collectors reach
+the central stack **only through a dedicated, isolated WireGuard client**; the host
+network configuration is not modified and **no published ports** exist.
 
-It runs:
+This repo is the collector side only. It does not run Prometheus, Grafana or Loki, and
+the central WireGuard hub lives in the central monitoring repository.
 
-- **node_exporter**: host-level metrics (CPU, RAM, disk, filesystem, etc.)
-- **cAdvisor**: container-level metrics (CPU/RAM/IO per container)
-- **alloy**: ships the Traefik access log to a central Loki
-
-> This repo does **not** include Prometheus/Grafana/Loki. It is the **collector** side: you need a Prometheus server that scrapes the exporters, and a Loki endpoint that Alloy can push to.
+> Deploying on Dokploy? Use **[docs/vpn-dokploy.md](docs/vpn-dokploy.md)**: it is the
+> end-to-end operator guide (peer export, File Mounts, firewall, verification,
+> recovery, removal). This README is the front door for a local checkout.
 
 ---
 
-## Requirements
+## Network model
 
-- A Linux VPS with Docker installed
-- Docker Compose (plugin or standalone)
-
-Quick sanity check:
-
-```bash
-docker --version
-docker compose version
+```
+        central hub (other repo)                     this VPS
+  ┌──────────────────────────────┐        ┌──────────────────────────────────────┐
+  │ Prometheus   Loki            │        │ namespace A  (vpn container only)     │
+  │ wg0 = 10.77.0.1              │        │  wg0 = 10.77.0.2/32                   │
+  └──────────────┬───────────────┘        │  node_exporter :9100                  │
+                 │ public UDP 51820       │  cadvisor      :8080                  │
+                 └────────────────────────┤  alloy -> http://10.77.0.1:3100/...    │
+                                          │    (all three: network_mode service:vpn)│
+                                          └───────────────┬──────────────────────┘
+                                                          │ vpn_egress bridge
+  ┌────────────────────────────────────────────────────────┴─────────────────────┐
+  │ host: no wg0, no routes, no DNS, no firewall change, no published ports      │
+  └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
+One namespace holds `wg0`; the three collectors join it. The host, host routes, host
+DNS, sysctls, host firewall rules and Traefik are untouched.
+
 ---
 
-## Services & Ports
+## Services
 
-| Service       | Purpose                       | Port   | URL                                                             |
-| ------------- | ----------------------------- | ------ | --------------------------------------------------------------- |
-| node_exporter | Host metrics exporter         | `9100` | `http://<VPS_IP>:9100/metrics`                                  |
-| cAdvisor      | Docker/container metrics      | `8080` | `http://<VPS_IP>:8080/` (UI) and `http://<VPS_IP>:8080/metrics` |
-| alloy         | Traefik log shipper → Loki    | —      | no published port (push only; UI on `12345` inside the container) |
+| Service | Image | Purpose | Published ports |
+| --- | --- | --- | --- |
+| `vpn` | `lscr.io/linuxserver/wireguard:1.0.20260223-r0-ls126` | Owns the isolated namespace, builds `wg0`, installs the in-namespace guard | none |
+| `node_exporter` | `prom/node-exporter:v1.10.2` | Host CPU/RAM/disk/filesystem metrics | none |
+| `cadvisor` | `gcr.io/cadvisor/cadvisor:v0.52.0` | Per-container metrics | none |
+| `alloy` | `grafana/alloy:v1.20.1` | Traefik access log -> central Loki | none |
+
+**No published ports.** The exporters are reachable only from the central hub through
+the tunnel, at the peer tunnel address (`10.77.0.2:9100`, `10.77.0.2:8080` in this
+example). Container state, not connectivity, is what `docker compose ps` shows.
 
 ---
 
 ## Configuration
 
-Every variable this stack reads lives in [`env.example`](env.example). Copy it and fill in the real values:
+`cp env.example .env`, then fill it in. `.env` is git-ignored; `env.example` is tracked,
+so keep it free of real values.
 
-```bash
-cp env.example .env
-```
+| Variable | Required | Description |
+| --- | --- | --- |
+| `VPS_NAME` | yes | Short unique name (`[A-Za-z0-9._-]+`), becomes the `vps` log label |
+| `LOKI_PUSH_URL` | yes | Full push URL on the **hub tunnel address**, for example `http://10.77.0.1:3100/loki/api/v1/push` |
+| `VPN_ENDPOINT_IP` | no | Hub public IPv4 when the client config's `Endpoint` is a DNS name |
+| `VPN_EXPORTER_PORTS` | no | Ports Prometheus scrapes through the tunnel (default `9100,8080`) |
+| `VPN_HANDSHAKE_MAX_AGE` | no | Max handshake age in seconds for `vpnctl verify` (default `180`) |
+| `VPN_SUPERVISE_INTERVAL` | no | VPN supervisor period in seconds (default `10`) |
+| `WG_CONFIG_BASE64` | no | Base64 of the whole config. **Not the default**: base64 is not encryption |
 
-`.env` is git-ignored; `env.example` is tracked, so keep it free of real secrets.
+Do not set `VPN_CONFIG_FILE`: the container default `/config/wg0.conf` is already
+correct, and setting it alongside `WG_CONFIG_BASE64` is rejected as ambiguous.
 
-| Variable        | Required | Read by | Description                                                     |
-| --------------- | -------- | ------- | --------------------------------------------------------------- |
-| `VPS_NAME`      | yes      | alloy   | Identifies this VPS in every log stream (label `vps`)           |
-| `LOKI_PUSH_URL` | yes      | alloy   | Full Loki push endpoint, including the `/loki/api/v1/push` path |
-| `LOKI_USER`     | no       | alloy   | Basic auth user for Loki (requires the edits below)             |
-| `LOKI_PASSWORD` | no       | alloy   | Basic auth password for Loki (requires the edits below)         |
-
-`node_exporter` and `cadvisor` read no environment variables.
-
-`VPS_NAME` and `LOKI_PUSH_URL` are declared with `${VAR:?Set VAR}` in the compose file, so `docker compose` **refuses to start** while either is missing instead of shipping logs with no `vps` label. Verify your `.env` before starting:
-
-```bash
-docker compose --env-file env.example config
-```
-
-If your Loki needs authentication, three edits are required, all listed in `env.example`:
-
-1. Uncomment `LOKI_USER` / `LOKI_PASSWORD` in `.env`
-2. Add both to the alloy service's `environment:` list in `docker-compose.yml`
-3. Uncomment the `basic_auth` block at the bottom of `files/config.alloy`
+The client config is a real WireGuard client file generated for this VPS by
+`scripts/vpn/peer.sh show <name>` on the central VPS. It contains the peer private
+key, so it is **never committed**: `files/wg0.conf` is git-ignored.
+[`files/wg0.conf.example`](files/wg0.conf.example) is the fake template.
 
 ---
 
-## Run
-
-From the repository directory:
+## Local quick start
 
 ```bash
+# 1. Put the exported client config in place (never commit it).
+mkdir -p files && cp /path/to/exported/wg0.conf files/wg0.conf
+
+# 2. Dummy-check the config without touching the network.
+env VPS_NAME=x LOKI_PUSH_URL='http://10.77.0.1:3100/loki/api/v1/push' \
+  VPN_CONFIG_FILE=files/wg0.conf.example sh files/vpnctl check-config
+
+# 3. Configure and start.
+cp env.example .env          # then edit VPS_NAME / LOKI_PUSH_URL
 docker compose up -d
-```
-
-Check status:
-
-```bash
 docker compose ps
+
+# 4. Readiness, then connectivity (different claims).
+docker compose exec vpn /bin/sh /opt/vpn/vpnctl status
+docker compose exec vpn /bin/sh /opt/vpn/vpnctl verify
 ```
 
-View logs:
-
-```bash
-docker compose logs -f alloy
-```
-
-Validate the Alloy config without restarting the service:
-
-```bash
-docker compose exec alloy alloy fmt /etc/alloy/config.alloy
-```
-
-Stop:
-
-```bash
-docker compose down
-```
-
-Remove the Alloy positions/data volume too:
-
-```bash
-docker compose down -v
-```
+`status` reports the readiness marker, interface, hub route, guard, handshake age and
+transfer totals. `verify` is the only command that claims connectivity: it exits 1
+when no handshake exists or the last one is older than `VPN_HANDSHAKE_MAX_AGE`.
+`docker compose logs -f vpn` follows logs; `docker compose down` keeps `alloy_data`.
 
 ---
 
-## Prometheus (how to scrape these exporters)
+## Prometheus (point it at the tunnel address)
 
-On your Prometheus server, add scrape jobs like:
+The exporters have no host port, so scrape the **peer tunnel address**, never a public
+VPS IP:
 
 ```yaml
 scrape_configs:
   - job_name: "vps-node-exporter"
     static_configs:
-      - targets: ["<VPS_IP>:9100"]
+      - targets: ["<PEER_TUNNEL_IP>:9100"]   # e.g. 10.77.0.2:9100
 
   - job_name: "vps-cadvisor"
     static_configs:
-      - targets: ["<VPS_IP>:8080"]
+      - targets: ["<PEER_TUNNEL_IP>:8080"]   # e.g. 10.77.0.2:8080
 ```
 
-Then reload Prometheus.
+Prometheus must run where the tunnel is reachable (on the hub, its own `wg0`).
 
 ---
 
-## Logs (Alloy → Loki)
+## Logs (Alloy -> Loki)
 
-`alloy` tails `/var/log/traefik/access.log`, labels every stream with `job="traefik"` and `vps="$VPS_NAME"`, and pushes to `LOKI_PUSH_URL`.
+`alloy` tails `/var/log/traefik/access.log`, labels every stream with
+`job="traefik"` and `vps="$VPS_NAME"`, and pushes to `LOKI_PUSH_URL`. The read-only
+Traefik directory mount and the persistent `alloy_data` positions volume are preserved.
 
-The pipeline in `files/config.alloy` handles **both** Traefik access log formats, so you can switch format later without editing it:
+| Format | How it is parsed | Labels available |
+| --- | --- | --- |
+| `common` (Traefik/Dokploy default) | `stage.regex` | `method`, `status` |
+| `json` | `stage.json` | `method`, `status`, `router`, `service` |
 
-| Format                    | How it is parsed  | Labels available                    |
-| ------------------------- | ----------------- | ----------------------------------- |
-| `common` (Traefik default) | `stage.regex`     | `method`, `status`                  |
-| `json`                    | `stage.json`      | `method`, `status`, `router`, `service` |
-
-`router` and `service` only exist in JSON access logs: the CLF format does not contain them. To get them, set `accessLog.format: json` in your Traefik static config.
-
-`client_ip` and `path` are extracted but deliberately **not** turned into labels: they are high-cardinality and would blow up the Loki index.
-
-Query in Grafana:
+`client_ip` and `path` stay in the log line and are never promoted to labels.
 
 ```logql
 {job="traefik", vps="vps-1"} |= "500"
 {job="traefik", vps="vps-1", status="502"}
 ```
 
----
-
-## Dokploy notes
-
-If you paste this compose into a Dokploy **Compose** service, two things differ from running it in this repo:
-
-1. **The config mount path.** Dokploy keeps the compose file at `/etc/dokploy/compose/<app>/code/docker-compose.yml`, so its "files" directory is one level up. Change:
-
-   ```yaml
-   - ./files/config.alloy:/etc/alloy/config.alloy:ro
-   ```
-
-   to:
-
-   ```yaml
-   - ../files/config.alloy:/etc/alloy/config.alloy:ro
-   ```
-
-   This is the only line that changes.
-
-   Then create the config file in the Dokploy UI (**Advanced → Mounts → File Mount**):
-
-   | Field      | Value                                |
-   | ---------- | ------------------------------------ |
-   | File Path  | `config.alloy`                       |
-   | Mount Path | `/etc/alloy/config.alloy`            |
-   | Content    | the contents of `files/config.alloy` |
-
-2. **The log source.** `/etc/dokploy/traefik/dynamic` already holds `access.log` on a Dokploy host. On a plain VPS without Dokploy, point that mount at whatever directory your Traefik instance writes access logs to, and adjust `__path__` in `files/config.alloy` to match.
+There is no write-ahead log: unsent entries wait in a bounded in-memory queue and can
+be lost on restart or a long outage. There is no exactly-once delivery. Container logs
+are bounded (`json-file`, `10m` x `3`).
 
 ### Two copies of `config.alloy`
 
-The Dokploy File Mount writes its own file, and that is the one the container actually runs:
+| Copy | Path | Used by |
+| --- | --- | --- |
+| Repository | `files/config.alloy` | `docker compose` on a local checkout |
+| Dokploy | `/etc/dokploy/compose/<app>/files/config.alloy` | the deployed service (File Mount) |
 
-| Copy       | Path                                              | Used by                            |
-| ---------- | ------------------------------------------------- | ---------------------------------- |
-| Repository | `files/config.alloy`                              | `docker compose` on this checkout  |
-| Dokploy    | `/etc/dokploy/compose/<app>/files/config.alloy`   | the deployed service               |
-
-They are independent files. Editing and committing the repository copy does **not** change the deployed pipeline: paste the updated content into the File Mount (Dokploy keeps it across deployments), or the VPS keeps shipping logs through the old config with no error to tell you.
-
-Set `VPS_NAME` and `LOKI_PUSH_URL` in the Dokploy Environment tab. Dokploy injects them as compose environment variables, so no `.env` file is needed there.
-
-`config.alloy` is bind-mounted read-only, so restarting the service is enough to pick up edits:
-
-```bash
-docker compose restart alloy
-```
+Editing the repository copy does not change the deployed pipeline: paste the content
+into the Dokploy File Mount. The same two copies exist for `files/vpnctl` and
+`files/wg0.conf`.
 
 ---
 
-## Security Notes (don’t be reckless)
+## Metrics semantics
 
-Right now this compose file publishes metrics endpoints to the network:
+| Signal | Source |
+| --- | --- |
+| Host CPU, memory, disk, filesystem | host-mounted `/host/proc`, `/host/sys`, `/rootfs` — unchanged |
+| Host NIC counters | `vpnctl hostnet-loop` reads `/host/proc/1/net/dev`; node_exporter textfile collector exposes `node_network_*{source="hostnet"}` |
+| Container CPU/memory/IO | cAdvisor, unchanged |
+| Network-namespace-scoped collectors | disabled (`netdev`, `netclass`, `netstat`, `sockstat`, ...); do not re-enable them |
 
-- `9100:9100`
-- `8080:8080`
+`hostnet_metrics_available 0` means the host NIC read was denied (kernel or AppArmor):
+counters are absent, never wrong. Per-container `container_network_*` series for these
+three containers describe the shared VPN namespace, not host totals.
 
-That’s fine for a private network, but on a public VPS you should **NOT** leave these ports open to the whole internet.
+---
 
-Recommended options:
+## Security notes
 
-- Restrict access via firewall (UFW / security groups): allow only your Prometheus server IP
-- Run behind a VPN (Tailscale / WireGuard)
-- Bind to localhost and scrape via SSH tunnel / reverse proxy (advanced)
-
-For `alloy` itself:
-
-- It runs as UID/GID `473` (the `alloy` user in the image), with `cap_drop: ALL` and `no-new-privileges:true`
-- It mounts the Traefik log directory **read-only** and never publishes a port
-- It does send log lines off the box to `LOKI_PUSH_URL`: treat that endpoint as a data-egress boundary and keep it on a private network when possible
+- **No public ports, no host network namespace.** No service uses `network_mode: host`
+  or publishes a port; `vpn` adds only `NET_ADMIN` and drops every other capability.
+- **cAdvisor stays privileged.** Its host mounts are required for container metrics, so
+  the tunnel is *network scoping*, not a security boundary against a compromised
+  privileged cAdvisor.
+- **`WG_CONFIG_BASE64` is not a secret.** `docker inspect` and any local Docker
+  administrator can read it. Use the read-only File Mount.
+- **Traffic cannot fall back to public egress:** the default route is removed after the
+  hub endpoint route is pinned, and the namespace guard is default-DROP.
 
 ---
 
 ## Troubleshooting
 
-**Alloy restarts in a loop.** Check `docker compose logs alloy`. The usual causes:
+**`vpn` is unhealthy / restart-loops ("not ready").** `vpnctl` only writes the
+readiness marker after `wg0`, the hub route and the guard verify. Read the field named
+in the log (never a key value) with `docker compose logs vpn`.
 
-- `files/config.alloy` missing (Docker creates a *directory* at that path and Alloy finds no config)
-- `VPS_NAME` or `LOKI_PUSH_URL` unset (compose fails before starting)
-- The `alloy_data` volume already existed owned by root, so UID 473 cannot write the positions file. Fix with `docker compose down -v`, or `docker run --rm -v <project>_alloy_data:/d alpine chown 473:473 /d`
+**"cannot create wg0: the wireguard kernel module must be loaded".** The host has no
+`wireguard` module. Ubuntu 20.04+ ships it; do not add `SYS_MODULE` or
+`/lib/modules` here and do not create `wg0` on the host.
 
-**Alloy runs but Loki receives nothing.** Check that `/var/log/traefik/access.log` exists inside the container:
+**`verify` says "no handshake ... (never)".** The tunnel is built but the hub never
+answered. Check the provider firewall (outbound UDP `51820` to the central public IP),
+that the central hub is up, and that the peer is still enrolled centrally.
+
+**Collectors look alive but the hub sees nothing (stale namespace).** Recreating only
+`vpn` gives it a new namespace and leaves the collectors on the old one. Check and
+repair:
 
 ```bash
-docker compose exec alloy ls -l /var/log/traefik
+export COMPOSE_FILE=/etc/dokploy/compose/<app>/code/docker-compose.yml
+export COMPOSE_PROJECT_NAME=<app>
+scripts/vpn-redeploy.sh --check
+scripts/vpn-redeploy.sh
 ```
 
-If the file is missing, Traefik is not writing access logs, or the mount points at the wrong directory.
+**`hostnet_metrics_available 0`.** The host NIC read was denied. Host NIC counters are
+missing rather than wrong; fix the read permission, do not re-enable `netdev`.
 
-**Logs arrive without `router`/`service` labels.** Expected with the `common` access log format. Switch Traefik to `accessLog.format: json`.
+**Loki is down.** Alloy retries in memory, `docker compose ps` still shows `running`,
+and nothing is sent publicly. Expect gaps for the outage window.
+
+**A File Mount was not created.** Docker turns a missing bind source into an empty
+directory, so `vpnctl` reports the configuration file as not found or invalid.
+Create the File Mount and redeploy.
 
 ---
 
-## What this is (and what it isn’t)
+## Tests
 
-✅ Good for:
+Deterministic, offline, no Docker daemon and no key material required:
 
-- Exporting host + container metrics from a VPS
-- Forwarding Traefik access logs from a VPS to a central Loki
-- Feeding a central Prometheus/Grafana/Loki stack
+```bash
+bash tests/run.sh
+```
 
-❌ Not included:
+It runs every `tests/test_*.sh` in sorted order and exits non-zero if any suite fails.
+Individual suites: `test_vpnctl_config.sh`, `test_vpnctl_setup.sh`,
+`test_vpnctl_hostnet.sh`, `test_compose_contract.sh` (skips without the Docker CLI),
+`test_redeploy_contract.sh`, `test_docs_contract.sh`.
 
-- Prometheus
-- Loki
-- Grafana dashboards
-- Alertmanager rules
-- Docker container *stdout* logs (only the Traefik access log is shipped; add a `loki.source.docker` component if you need those)
+The suite never starts a container. A separate local Docker Desktop sandbox (fake keys,
+fake hub, no published ports, torn down afterwards) was used once during development to
+exercise the real container path; it is not part of the suite and it is not the VPS
+pilot.
 
-If you want, the next logical step is to add a full monitoring stack (Prometheus + Grafana + Alertmanager + Loki) _or_ keep this repo as a clean "agent/collector" bundle and manage the server side centrally.
+---
+
+## Changed in this revision
+
+- The exporters no longer publish host ports (`9100`, `8080`). They are reachable only
+  through the isolated WireGuard tunnel at the peer tunnel address.
+- A dedicated `vpn` service owns the only namespace with `wg0`; `node_exporter`,
+  `cadvisor` and `alloy` join it with `network_mode: "service:vpn"`.
+- Host metrics are preserved: host procfs/sysfs/rootfs mounts are unchanged, and host
+  NIC counters come from a textfile written by `vpnctl`.
+- Already-deployed VPS stacks that still use the old files keep working until they are
+  redeployed; redeploying them switches them to the tunnel-only model.
+- Other VPSs, the central stack and the developer VPN are unaffected.
+
+Good for: exporting host + container metrics and Traefik access logs from a VPS over a
+private tunnel into a central stack. Not included: Prometheus, Loki, Grafana
+dashboards, alert rules, and Docker container stdout logs (only the Traefik access log is
+shipped).
