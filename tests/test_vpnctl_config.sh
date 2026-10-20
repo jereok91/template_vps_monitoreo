@@ -122,6 +122,19 @@ expect_rc 2 "file input plus base64 input is rejected as ambiguous"
 expect_err_contains "ambiguous" "ambiguity is named"
 
 # ---------------------------------------------------------------------------
+# Unexpected arguments are rejected instead of silently ignored (review finding).
+# ---------------------------------------------------------------------------
+set +e
+OUT="$(env VPS_NAME=vps-test LOKI_PUSH_URL="${LOKI}" \
+  VPN_CONFIG_FILE="${WORK}/valid.conf" \
+  "${SH_BIN}" "${VPNCTL}" check-config --typo 2>"${WORK}/stderr")"
+RC=$?
+set -e
+ERR="$(cat "${WORK}/stderr")"
+expect_rc 2 "unexpected subcommand arguments are rejected"
+expect_err_contains "Usage" "unexpected arguments print the usage"
+
+# ---------------------------------------------------------------------------
 # Required sections and keys.
 # ---------------------------------------------------------------------------
 sed '/^\[Interface\]/d' "${WORK}/valid.conf" >"${WORK}/no-interface.conf"
