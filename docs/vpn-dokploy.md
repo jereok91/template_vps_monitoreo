@@ -49,7 +49,7 @@ section 13 lists exactly what is still unproven.
 | --- | --- |
 | Linux VPS | Must have the `wireguard` kernel module available. Ubuntu 20.04+ ships it; nothing is installed with DKMS here. |
 | No host `wg0` | Do not create a WireGuard interface on the host. When `vpnctl` runs `ip link add dev wg0 type wireguard` inside the container namespace, the kernel autoloads the module. If that call fails, the module is missing on the host: fix the host, do not add `SYS_MODULE` or `/lib/modules` to this stack. |
-| Docker + Dokploy | Docker with the Compose plugin. |
+| Docker + Dokploy | Docker with the Compose plugin. IPv6 is optional: the guard locks it down when the namespace has any, and skips it on IPv4-only hosts. |
 | Central hub | Reachable on its public **UDP** port (default `51820`). The hub itself is managed by the central repository; this template never changes it. |
 | Dokploy Compose type | **Docker Compose**, not **Stack**. |
 
@@ -120,45 +120,37 @@ project or its firewall guard: the client design here assumes they stay as they 
 
 ---
 
-## 5. Dokploy File Mounts
+## 5. Dokploy File Mounts: only the client config is a secret
 
-Three files are mounted, all read-only. Create each one in the Dokploy UI under
-**Advanced -> Mounts -> File Mount**; the File Path is a name relative to the app's
-`files/` directory.
+`vpnctl` and `config.alloy` are committed to this repository, so Dokploy's clone
+already contains them under `./files/`. Only the per-VPS client configuration
+(which holds the peer private key) comes from outside the repository, through one
+Dokploy File Mount.
 
-| Repository path | Dokploy File Path (Advanced -> Mounts) | Container mount path | Why |
-| --- | --- | --- | --- |
-| `files/vpnctl` | `vpnctl` | `/opt/vpn/vpnctl` | The entrypoint and healthcheck. It validates the client config, builds the tunnel, installs the guard and writes the readiness marker. |
-| `files/wg0.conf` (never committed; `files/wg0.conf.example` is the template) | `wg0.conf` | `/config/wg0.conf` | The per-VPS client configuration exported on the central VPS. Contains the peer private key. |
-| `files/config.alloy` | `config.alloy` | `/etc/alloy/config.alloy` | The Traefik access-log pipeline that pushes to the central Loki over the tunnel. |
-
-### The `./files/` -> `../files/` rewrite
-
-Dokploy keeps the Compose file at `/etc/dokploy/compose/<app>/code/docker-compose.yml`,
-so its durable files live one level up in `/etc/dokploy/compose/<app>/files/`.
-Rewrite **every `./files/` occurrence** in `docker-compose.yml` to `../files/`:
-
-```yaml
-- ../files/vpnctl:/opt/vpn/vpnctl:ro
-- ../files/wg0.conf:/config/wg0.conf:ro
-- ../files/config.alloy:/etc/alloy/config.alloy:ro
-```
-
-Repository-relative mounts (`./files/...`) are wiped by Dokploy's AutoDeploy: the
-deployed directory is replaced, so a file that only exists in the repository copy is
-gone after the next deploy. Durable files live in `<app>/files/`, which is what the
-File Mounts write and what `../files/...` resolves to.
-
-### Two copies of every mounted file
-
-| Copy | Path | Used by |
+| File | Where it comes from | Container path |
 | --- | --- | --- |
-| Repository | `files/vpnctl`, `files/config.alloy` | `docker compose` on a local checkout |
-| Dokploy | `/etc/dokploy/compose/<app>/files/...` | the deployed service |
+| `vpnctl` | the repository clone: `<app>/code/files/vpnctl` | `/opt/vpn/vpnctl` (read-only) |
+| `config.alloy` | the repository clone: `<app>/code/files/config.alloy` | `/etc/alloy/config.alloy` (read-only) |
+| `wg0.conf` | Dokploy durable files: `<app>/files/wg0.conf` | `/config/wg0.conf` (read-only) |
 
-They are independent files. Editing the repository copy does not change the deployed copy:
-paste the updated content into the File Mount and redeploy. Otherwise the VPS
-keeps running the old script or pipeline with no error to tell you.
+Setup:
+
+1. **Advanced -> Mounts -> File Mount**: File Path `wg0.conf`, Content = the client
+   configuration exported on the central VPS. Dokploy stores it in
+   `<app>/files/wg0.conf`, which survives redeploys.
+2. **Environment** tab: set `WG_CONFIG_PATH=../files/wg0.conf`. The compose default
+   is `./files/wg0.conf`, which is what a local checkout uses.
+3. Leave the `./files/vpnctl` and `./files/config.alloy` mounts exactly as they are
+   in `docker-compose.yml`.
+
+Do **not** rewrite those two mounts to `../files/`. They are part of the clone and
+always present; pointing them at the File Mount directory would leave a missing
+source, and Docker turns a missing bind source into an empty directory. The service
+then fails to start or restart-loops with a confusing error.
+
+`vpnctl` and `config.alloy` pick up repository changes on the next deploy (the clone
+is refreshed); the `wg0.conf` File Mount is independent of the repository and is the
+only copy the build reads.
 
 ---
 
@@ -280,10 +272,23 @@ key value:
 docker compose logs vpn
 ```
 
-Frequent causes: a File Mount that was not created (Docker turns the missing source
-into an empty directory), a `wg0.conf` still holding `<PLACEHOLDER>` tokens, a
-`LOKI_PUSH_URL` whose host is not covered by `AllowedIPs`, or a `VPS_NAME` with an
-unsupported character.
+Frequent causes: the `wg0.conf` File Mount was not created (Docker turns a missing
+bind source into an empty directory), a configuration still holding
+`<PLACEHOLDER>` tokens, a `LOKI_PUSH_URL` whose host is not covered by
+`AllowedIPs`, or a `VPS_NAME` with an unsupported character.
+
+The container can also be *running* while the healthcheck never passes; the same
+log shows why. It never contains key material:
+
+```bash
+docker compose -p <app> logs --tail 100 vpn
+```
+
+Look for the field or step named on the last `vpnctl:` line: `configuration path is
+a directory` (wrong mount path or `WG_CONFIG_PATH`), `not covered by AllowedIPs`
+(`LOKI_PUSH_URL` is not the hub tunnel address), `cannot create wg0` (the host
+kernel has no `wireguard` module), or `invalid PrivateKey` (the mount holds the
+fake template instead of the exported file).
 
 ---
 

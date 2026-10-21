@@ -303,3 +303,27 @@ firewall was touched and no server was contacted.
     suite (466 assertions) plus the local Docker Desktop sandbox re-run against
     the corrected runtime (healthy, IPv6 DROP policies, healthcheck fails when an
     allow rule is removed, clean teardown).
+
+### L5 — first real Dokploy deployment: two template defects
+
+A deployment of the branch reported `container vpn is unhealthy` (the container
+started, the readiness gate never passed). Two defects were found and fixed:
+
+- **IPv6 lockdown failed closed on IPv4-only hosts.** `guard_ipv6_drop` required
+  `ip6tables` and failed the whole guard when the host has IPv6 disabled (a common
+  VPS hardening), so the client never became ready. The guard now locks IPv6 down
+  only when the namespace has any (`/proc/net/if_inet6`, overridable for tests),
+  records `ipv6=locked|absent` in the readiness marker, and has a test for the
+  IPv4-only path.
+- **The mount instruction was a footgun.** The docs told the operator to rewrite
+  every `./files/` mount to `../files/` and create three File Mounts, but only
+  `wg0.conf` is a secret. With one File Mount, a partial rewrite leaves
+  `/opt/vpn/vpnctl` pointing at a missing source (Docker creates an empty
+  directory) and the container restart-loops. Now `vpnctl` and `config.alloy` come
+  from the clone and only the client config is a Dokploy File Mount, addressed
+  through `${WG_CONFIG_PATH:-./files/wg0.conf}`; docs, README, `env.example` and
+  the contract tests were updated.
+
+The exact VPS cause still needs `docker compose -p <app> logs --tail 100 vpn`;
+`docs/vpn-dokploy.md` lists the messages to look for (mount path, uncovered
+`LOKI_PUSH_URL`, missing kernel module, placeholder keys).

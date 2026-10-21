@@ -246,4 +246,10 @@ else
   ok "docker-compose.yml publishes no exporter port"
 fi
 
+if grep -qF 'WG_CONFIG_PATH' "${COMPOSE}"; then
+  ok "the client config mount is overridable for Dokploy (WG_CONFIG_PATH)"
+else
+  bad "the client config mount is hardcoded; Dokploy cannot point it at ../files"
+fi
+
 finish

@@ -281,6 +281,7 @@ export_env() {
   export STUB_FAIL_LINK_ADD=0
   export STUB_WG_NO_ENDPOINT=0
   export STUB_FAIL_RULE=''
+  export VPN_NAMESPACE_IPV6=1
   export PATH="${WORK}/bin:${PATH}"
   unset WG_CONFIG_BASE64 VPN_ENDPOINT_IP VPN_HOSTNET_ONCE 2>/dev/null || true
 }
@@ -632,6 +633,33 @@ if grep -q '^default ' "${WORK}/state/routes" 2>/dev/null; then
 else
   bad "TERM left the namespace without a default route"
 fi
+
+# A host with IPv6 disabled: readiness must work and no v6 rule is written.
+reset_state
+: >"${WORK}/state/ip6tables"
+export_env 3600
+export VPN_NAMESPACE_IPV6=0
+launch_up "${WORK}/noipv6.out"
+if wait_for_file "${WORK}/run/ready" 60; then
+  ok "an IPv4-only namespace becomes ready"
+else
+  bad "an IPv4-only namespace never became ready"
+  sed -e 's/^/    /' "${WORK}/noipv6.out.err" >&2
+fi
+if [ -s "${WORK}/state/ip6tables" ]; then
+  bad "IPv6 rules were written even though the namespace has no IPv6"
+else
+  ok "no IPv6 rule is written when the namespace has no IPv6"
+fi
+if grep -qx 'ipv6=absent' "${WORK}/run/ready" 2>/dev/null; then
+  ok "the readiness marker records that IPv6 was absent"
+else
+  bad "the readiness marker does not record the IPv6 state"
+fi
+kill -TERM "${UP_PID}" 2>/dev/null || true
+wait "${UP_PID}" 2>/dev/null || true
+UP_PID=''
+export VPN_NAMESPACE_IPV6=1
 
 # ---------------------------------------------------------------------------
 # 4. Failure injection: no readiness on any setup failure.

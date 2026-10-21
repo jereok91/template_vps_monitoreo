@@ -60,24 +60,26 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 2. The three Dokploy File Mounts (repository path, File Path name, target).
+# 2. Dokploy mounts: two files from the clone, one secret File Mount.
 # ---------------------------------------------------------------------------
-while read -r repo_path file_path target; do
-  have "${DOC}" "${repo_path}" "File Mount row names the repository path ${repo_path}"
-  have "${DOC}" "\`${file_path}\`" "File Mount row names the File Path ${file_path}"
-  have "${DOC}" "${target}" "File Mount row names the container path ${target}"
-done <<'MOUNTS'
-files/vpnctl vpnctl /opt/vpn/vpnctl
-files/wg0.conf wg0.conf /config/wg0.conf
-files/config.alloy config.alloy /etc/alloy/config.alloy
-MOUNTS
-
-have "${DOC}" 'every `./files/` occurrence' "the ./files/ -> ../files/ rewrite is stated as a rule"
-for rewritten in vpnctl wg0.conf config.alloy; do
-  have "${DOC}" "../files/${rewritten}" "the rewrite is shown for ${rewritten}"
+have "${DOC}" 'WG_CONFIG_PATH=../files/wg0.conf' \
+  "the guide documents the Dokploy client-config path override"
+have "${DOC}" '<app>/files/wg0.conf' "the guide names where the File Mount is stored"
+have "${DOC}" 'Dokploy File Mount' "the guide documents the File Mount step"
+for target in /opt/vpn/vpnctl /config/wg0.conf /etc/alloy/config.alloy; do
+  have "${DOC}" "${target}" "the mount table names the container path ${target}"
 done
-have "${DOC}" 'Editing the repository copy does not change the deployed copy' \
-  "the two-copy warning is stated"
+if grep -qF 'every `./files/` occurrence' "${DOC}"; then
+  bad "the guide still tells the operator to rewrite every ./files/ mount"
+else
+  ok "the guide no longer rewrites the committed mounts"
+fi
+have "${DOC}" 'Do **not** rewrite those two mounts' \
+  "the guide warns against rewriting the committed mounts"
+have "${DOC}" 'pick up repository changes on the next deploy' \
+  "the guide states when repository copies reach the deployment"
+have "${DOC}" 'independent of the repository' \
+  "the guide states that the client-config File Mount is independent"
 
 # ---------------------------------------------------------------------------
 # 3. The eight numbered operator steps.

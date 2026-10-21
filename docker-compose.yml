@@ -61,11 +61,13 @@ services:
       # encryption: `docker inspect` shows it to any local Docker administrator.
       WG_CONFIG_BASE64: ${WG_CONFIG_BASE64:-}
     volumes:
-      # Repository / plain `docker compose`: ./files/...
-      # Dokploy: change every ./files/ to ../files/ (Dokploy keeps durable files
-      # one level above the compose directory). Same rule as config.alloy.
+      # vpnctl and config.alloy are committed, so the clone already has them and
+      # no Dokploy File Mount is needed for them.
       - ./files/vpnctl:/opt/vpn/vpnctl:ro
-      - ./files/wg0.conf:/config/wg0.conf:ro
+      # The client config is a secret and never committed. A local checkout uses
+      # ./files/wg0.conf; on Dokploy set WG_CONFIG_PATH=../files/wg0.conf, which
+      # is where the File Mount stores it (durable, survives redeploys).
+      - ${WG_CONFIG_PATH:-./files/wg0.conf}:/config/wg0.conf:ro
       # Read-only host procfs: vpnctl reads /host/proc/1/net/dev so host NIC
       # counters are measured in the host network namespace, not in this one.
       - /proc:/host/proc:ro

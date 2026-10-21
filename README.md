@@ -65,6 +65,7 @@ so keep it free of real values.
 | `VPN_EXPORTER_PORTS` | no | Ports Prometheus scrapes through the tunnel (default `9100,8080`) |
 | `VPN_HANDSHAKE_MAX_AGE` | no | Max handshake age in seconds for `vpnctl verify` (default `180`) |
 | `VPN_SUPERVISE_INTERVAL` | no | VPN supervisor period in seconds (default `10`) |
+| `WG_CONFIG_PATH` | no | Host path of the client config mount (default `./files/wg0.conf`; Dokploy: `../files/wg0.conf`) |
 | `WG_CONFIG_BASE64` | no | Base64 of the whole config. **Not the default**: base64 is not encryption |
 
 Do not set `VPN_CONFIG_FILE`: the container default `/config/wg0.conf` is already
@@ -146,10 +147,19 @@ There is no write-ahead log: unsent entries wait in a bounded in-memory queue an
 be lost on restart or a long outage. There is no exactly-once delivery. Container logs
 are bounded (`json-file`, `10m` x `3`).
 
-### Two copies of `config.alloy`
+### Dokploy and the three files
 
-| Copy | Path | Used by |
-| --- | --- | --- |
+`files/vpnctl` and `files/config.alloy` are committed, so the Dokploy clone already
+has them and no File Mount is needed. Only the secret `wg0.conf` comes from a
+Dokploy **File Mount** (`wg0.conf`), and the compose mount reads it through
+`WG_CONFIG_PATH` — set `WG_CONFIG_PATH=../files/wg0.conf` in Dokploy, leave the
+default `./files/wg0.conf` for a local checkout. See
+[`docs/vpn-dokploy.md`](docs/vpn-dokploy.md) §5.
+
+Do not rewrite the `vpnctl` / `config.alloy` mounts to `../files/`: Docker turns a
+missing bind source into an empty directory and the service fails or restart-loops.
+
+--- | --- | --- |
 | Repository | `files/config.alloy` | `docker compose` on a local checkout |
 | Dokploy | `/etc/dokploy/compose/<app>/files/config.alloy` | the deployed service (File Mount) |
 
@@ -219,9 +229,13 @@ missing rather than wrong; fix the read permission, do not re-enable `netdev`.
 **Loki is down.** Alloy retries in memory, `docker compose ps` still shows `running`,
 and nothing is sent publicly. Expect gaps for the outage window.
 
-**A File Mount was not created.** Docker turns a missing bind source into an empty
-directory, so `vpnctl` reports the configuration file as not found or invalid.
-Create the File Mount and redeploy.
+**`vpn` starts but the deploy says it is unhealthy.** The reason is in
+`docker compose -p <app> logs --tail 100 vpn` (vpnctl never prints key material).
+Frequent causes: the `wg0.conf` File Mount missing or `WG_CONFIG_PATH` unset
+(`configuration path is a directory`), `LOKI_PUSH_URL` not being the hub tunnel
+address (`not covered by AllowedIPs`), no `wireguard` module on the host
+(`cannot create wg0`), or the fake template mounted instead of the real file
+(`invalid PrivateKey`).
 
 ---
 

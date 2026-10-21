@@ -755,10 +755,21 @@ guard_policies_drop() {
   return 0
 }
 
-# The tunnel is IPv4-only. IPv6 is locked down completely: a namespace that
-# happens to get an IPv6 address must not become a public egress path that
-# bypasses the IPv4 guard.
+# The tunnel is IPv4-only. When the namespace has IPv6, it is locked down
+# completely: a namespace that happens to get an IPv6 address must not become a
+# public egress path that bypasses the IPv4 guard. Hosts with IPv6 disabled
+# (a common VPS hardening) have nothing to lock down and must still start.
+namespace_has_ipv6() {
+  case "${VPN_NAMESPACE_IPV6:-auto}" in
+    1) return 0 ;;
+    0) return 1 ;;
+  esac
+  [ -r /proc/net/if_inet6 ] || return 1
+  grep -q . /proc/net/if_inet6 2>/dev/null
+}
+
 guard_ipv6_drop() {
+  namespace_has_ipv6 || return 0
   command -v ip6tables >/dev/null 2>&1 || return 1
   ip6tables -F INPUT 2>/dev/null || return 1
   ip6tables -F OUTPUT 2>/dev/null || return 1
@@ -772,6 +783,7 @@ guard_ipv6_drop() {
 }
 
 guard_ipv6_verify() {
+  namespace_has_ipv6 || return 0
   command -v ip6tables >/dev/null 2>&1 || return 1
   for gv_chain in INPUT OUTPUT FORWARD; do
     gv_line=$(ip6tables -S "$gv_chain" 2>/dev/null | awk 'NR == 1 { print; exit }')
@@ -893,6 +905,11 @@ write_ready() {
     printf 'mtu=%s\n' "$MTU"
     printf 'allowed_ips=%s\n' "$ALLOWED_CSV"
     printf 'keepalive=%s\n' "${KEEPALIVE:-0}"
+    if namespace_has_ipv6; then
+      printf 'ipv6=locked\n'
+    else
+      printf 'ipv6=absent\n'
+    fi
     printf 'written_at=%s\n' "$(date +%s)"
   } >"$wr_tmp") || return 1
   chmod 600 "$wr_tmp" 2>/dev/null || true
