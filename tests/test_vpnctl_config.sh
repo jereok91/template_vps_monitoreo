@@ -94,7 +94,7 @@ expect_out_contains "hub (loki) address: 192.168.77.9" "non-default hub address 
 expect_out_contains "endpoint: 198.51.100.7:51999" "non-default endpoint is used"
 
 # ---------------------------------------------------------------------------
-# Input source: missing, directory, empty, ambiguous.
+# Input source: missing, unreadable, directory, empty, precedence.
 # ---------------------------------------------------------------------------
 run_check "${WORK}/does-not-exist.conf"
 expect_rc 2 "missing client config fails"
@@ -117,7 +117,9 @@ expect_err_contains "directory" "directory-instead-of-file is explained"
 run_check "${WORK}/empty.conf"
 expect_rc 2 "empty config fails"
 
-cp "${WORK}/valid.conf" "${WORK}/both.conf"
+# An explicit base64 input wins over the mounted file; the ignored file is
+# deliberately invalid so only the base64 branch can succeed.
+sed '/^\[Peer\]/d' "${WORK}/valid.conf" >"${WORK}/both.conf"
 set +e
 OUT="$(env VPS_NAME=vps-test LOKI_PUSH_URL="${LOKI}" \
   VPN_CONFIG_FILE="${WORK}/both.conf" \
@@ -126,10 +128,9 @@ OUT="$(env VPS_NAME=vps-test LOKI_PUSH_URL="${LOKI}" \
 RC=$?
 set -e
 ERR="$(cat "${WORK}/stderr")"
-expect_rc 2 "file input plus base64 input is rejected as ambiguous"
-expect_err_contains "ambiguous" "ambiguity is named"
-expect_err_contains "WG_CONFIG_BASE64 is set" "ambiguity names the base64 input"
-expect_err_contains "exists" "ambiguity names the mounted file"
+expect_rc 0 "base64 input takes precedence over the mounted file"
+expect_err_contains "ignoring the mounted configuration" "the ignored file is named"
+expect_out_contains "configuration ok" "the base64 branch is the one that validated"
 
 # ---------------------------------------------------------------------------
 # Unexpected arguments are rejected instead of silently ignored (review finding).

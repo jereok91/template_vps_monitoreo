@@ -277,11 +277,10 @@ bind source into an empty directory), a configuration still holding
 `<PLACEHOLDER>` tokens, a `LOKI_PUSH_URL` whose host is not covered by
 `AllowedIPs`, or a `VPS_NAME` with an unsupported character.
 
-`vpnctl: ambiguous configuration input: WG_CONFIG_BASE64 is set and …` means both
-inputs are present at once: the environment variable has a value **and** the
-mounted `/config/wg0.conf` exists. Remove `WG_CONFIG_BASE64` from the Environment
-tab (or set it empty) and keep the File Mount; the restart loop then stops
-immediately.
+`vpnctl: WG_CONFIG_BASE64 is set: using it and ignoring the mounted configuration …`
+means both inputs are present at once: the environment variable has a value **and**
+the mounted `/config/wg0.conf` exists. The base64 input wins; if you intended the
+File Mount, remove `WG_CONFIG_BASE64` from the Environment tab (or set it empty).
 
 The container can also be *running* while the healthcheck never passes; the same
 log shows why. It never contains key material:
@@ -439,8 +438,9 @@ configuration or certificates, and any other Docker network or container.
   the stack restart-loops by design rather than falling back.
 - **`WG_CONFIG_BASE64` is not a secret.** It is an opt-in fallback, and base64 is NOT encryption:
   `docker inspect`, the Dokploy UI and any local Docker administrator can
-  read it. Use the File Mount. Supply exactly one input; supplying both is rejected as
-  ambiguous.
+  read it. Use the File Mount. If both inputs are present, `WG_CONFIG_BASE64`
+  wins and the mounted file is ignored (the log names it); remove the variable to
+  use the file.
 - **Isolation is network scoping.** A privileged cAdvisor already has broad host read
   access, so this design limits where monitoring traffic goes, not what a compromised
   collector could read.

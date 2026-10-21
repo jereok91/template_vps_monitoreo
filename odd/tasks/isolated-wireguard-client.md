@@ -10,7 +10,7 @@ edit, no commit.
 - **S1 — Isolated ownership.** "Add a dedicated client VPN service with its own network namespace. Do NOT use network_mode: host, mount the host network namespace, install a host wg0, modify host routes/DNS/sysctls/firewall, or give the VPN service a Docker socket."
 - **S2 — Tunnel-only collectors.** "Make Alloy, Node Exporter, and cAdvisor reachable through that isolated tunnel. Sharing the VPN service's network namespace through Compose service network mode is a suitable starting point, not by merely attaching all services to the same Docker bridge." and "Remove public exporter port publications for the VPN deployment. Prometheus must reach the exporters directly through the peer tunnel address."
 - **S3 — Minimum capability.** "Use a maintained, deliberately pinned WireGuard client image ... Apply the minimum network capability required in that namespace; do not copy cAdvisor's existing privileged requirement to the VPN service or Alloy. Retain necessary cAdvisor host mounts." and "Document that cAdvisor's existing host privileges mean this is network scoping, not an absolute security boundary."
-- **S4 — Configuration delivery.** "Accept one standard WireGuard client configuration generated for that specific VPS. Prefer a protected read-only file/secret mounted through Dokploy ... Make file input the documented default and reject ambiguous simultaneous inputs. ... Base64 is NOT encryption."
+- **S4 — Configuration delivery.** "Accept one standard WireGuard client configuration generated for that specific VPS. Prefer a protected read-only file/secret mounted through Dokploy ... Make file input the documented default ... Base64 is NOT encryption." **Revision (L6):** when both inputs are present, `WG_CONFIG_BASE64` takes precedence and the mounted file is ignored with an explicit warning; the file stays the documented default.
 - **S5 — Routing scope.** "Preserve the supplied peer address, keys, central endpoint and keepalive. Validate that the supplied routing stays limited to the intended central monitoring address; do not accept default-route tunneling silently. Treat optional DNS settings and wg-quick hooks carefully: do not change host DNS or execute unexpected host-level commands."
 - **S6 — Traffic and failure behaviour.** "Allow only the intended monitoring traffic over the tunnel: Alloy pushes to central Loki; central Prometheus pulls the two exporters. Block unintended peer-to-peer access and other inbound tunnel ports, while allowing necessary replies. Implement the applicable client guard inside the isolated network namespace."
 - **S7 — Readiness vs connectivity.** "Separate readiness from connectivity claims. A created container does not mean wg0 exists; a configured interface does not prove a recent handshake."
@@ -303,6 +303,15 @@ firewall was touched and no server was contacted.
     suite (466 assertions) plus the local Docker Desktop sandbox re-run against
     the corrected runtime (healthy, IPv6 DROP policies, healthcheck fails when an
     allow rule is removed, clean teardown).
+
+### L6 — precedence decision (operator)
+
+> umm creo que dbes drle preminecia ques i tines el WG_CONFIG_BASE64  alli  usa este archivo
+
+Decision: an explicit `WG_CONFIG_BASE64` now wins over the mounted `wg0.conf`
+instead of being rejected as ambiguous. The ignored file is named in the log, the
+readiness marker records `config_source=file|base64`, and `vpnctl status` prints
+it. This supersedes the earlier "reject simultaneous inputs" clause of S4.
 
 ### L5 — first real Dokploy deployment: two template defects
 

@@ -530,6 +530,7 @@ expect_file_contains "${READY}" "gateway=${GATEWAY}" "marker records the gateway
 expect_file_contains "${READY}" "mtu=1420" "marker records the MTU"
 expect_file_contains "${READY}" "allowed_ips=${HUB}/32" "marker records the allowed routes"
 expect_file_contains "${READY}" "keepalive=25" "marker records the keepalive"
+expect_file_contains "${READY}" "config_source=file" "marker records that the file was the source"
 if grep -q -E '^written_at=[0-9]+$' "${READY}" 2>/dev/null; then
   ok "marker records an epoch timestamp"
 else
@@ -829,8 +830,8 @@ OUT="$(env VPS_NAME=vps-test LOKI_PUSH_URL="${LOKI}" \
 RC=$?
 set -e
 ERR="$(cat "${WORK}/stderr")"
-expect_rc 2 "file plus base64 input is rejected"
-expect_err_contains "ambiguous" "simultaneous inputs are reported as ambiguous"
+expect_rc 0 "base64 input wins when both sources are present"
+expect_err_contains "ignoring the mounted configuration" "the ignored file is reported"
 
 # ---------------------------------------------------------------------------
 # 7. Host NIC counters are produced while `up` supervises (loop is spawned).

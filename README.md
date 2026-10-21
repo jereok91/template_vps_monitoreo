@@ -69,7 +69,8 @@ so keep it free of real values.
 | `WG_CONFIG_BASE64` | no | Base64 of the whole config. **Not the default**: base64 is not encryption |
 
 Do not set `VPN_CONFIG_FILE`: the container default `/config/wg0.conf` is already
-correct, and setting it alongside `WG_CONFIG_BASE64` is rejected as ambiguous.
+correct. If `WG_CONFIG_BASE64` is also set, the base64 input **wins** and the
+mounted file is ignored (the log names the ignored file).
 
 The client config is a real WireGuard client file generated for this VPS by
 `scripts/vpn/peer.sh show <name>` on the central VPS. It contains the peer private
@@ -237,8 +238,9 @@ address (`not covered by AllowedIPs`), no `wireguard` module on the host
 (`cannot create wg0`), or the fake template mounted instead of the real file
 (`invalid PrivateKey`).
 
-`ambiguous configuration input` means `WG_CONFIG_BASE64` has a value **and** the
-mounted file exists: remove the variable from Dokploy's Environment tab. Use
+`WG_CONFIG_BASE64 is set: using it and ignoring the mounted configuration` means
+both inputs exist and base64 won. If you intended the File Mount, remove
+`WG_CONFIG_BASE64` from Dokploy's Environment tab. Use
 `sudo docker logs vpn` (or `docker compose -p <app> logs vpn`) to read the reason.
 
 ---
