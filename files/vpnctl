@@ -1232,8 +1232,18 @@ cmd_up() {
 # healthcheck (readiness only, never a handshake)
 # ---------------------------------------------------------------------------
 cmd_healthcheck() {
+  # The Docker healthcheck output is only visible in the health log, which makes
+  # an unhealthy deploy opaque. Mirror the first occurrence of each reason into
+  # the container log (PID 1's stderr) so `docker compose logs vpn` explains it.
   hc_no() {
     printf 'not ready: %s\n' "$1"
+    hc_log_target=${VPN_HEALTH_LOG:-/proc/1/fd/2}
+    hc_prev=''
+    [ -f "${VPN_RUN_DIR}/health.reason" ] && hc_prev=$(cat "${VPN_RUN_DIR}/health.reason" 2>/dev/null)
+    if [ "$hc_prev" != "$1" ]; then
+      printf '%s\n' "$1" >"${VPN_RUN_DIR}/health.reason" 2>/dev/null || true
+      printf 'vpnctl: not ready: %s\n' "$1" >>"$hc_log_target" 2>/dev/null || true
+    fi
     exit 1
   }
   [ -f "$READY_FILE" ] || hc_no "no readiness marker at $READY_FILE"
@@ -1277,6 +1287,7 @@ cmd_healthcheck() {
     "$hc_egress" "$hc_eip" "$hc_eport" ||
     hc_no "the traffic guard is incomplete (policies or an allow rule are missing)"
 
+  rm -f "${VPN_RUN_DIR}/health.reason" 2>/dev/null || true
   printf 'ready: %s %s via %s\n' "$hc_iface" "$hc_addr" "$hc_hub"
   exit 0
 }

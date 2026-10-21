@@ -327,3 +327,9 @@ started, the readiness gate never passed). Two defects were found and fixed:
 The exact VPS cause still needs `docker compose -p <app> logs --tail 100 vpn`;
 `docs/vpn-dokploy.md` lists the messages to look for (mount path, uncovered
 `LOKI_PUSH_URL`, missing kernel module, placeholder keys).
+
+A second deployment of the same fix still failed, so the container log is the
+remaining evidence; the readiness check now mirrors the first failure of each
+distinct cause into the container log (`vpnctl: not ready: <reason>`) so
+`docker compose logs vpn` explains an unhealthy deploy without shell access to the
+inside of the container.

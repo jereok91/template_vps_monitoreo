@@ -282,6 +282,7 @@ export_env() {
   export STUB_WG_NO_ENDPOINT=0
   export STUB_FAIL_RULE=''
   export VPN_NAMESPACE_IPV6=1
+  export VPN_HEALTH_LOG="${WORK}/health.log"
   export PATH="${WORK}/bin:${PATH}"
   unset WG_CONFIG_BASE64 VPN_ENDPOINT_IP VPN_HOSTNET_ONCE 2>/dev/null || true
 }
@@ -546,6 +547,19 @@ awk -v p="${HUB}/32" '$1 != p' "${WORK}/state/routes" >"${WORK}/state/routes.new
 mv "${WORK}/state/routes.new" "${WORK}/state/routes"
 capture "${SH_BIN}" "${VPNCTL}" healthcheck
 expect_rc 1 "healthcheck fails when the hub route is gone"
+if [ -s "${WORK}/health.log" ] && grep -q 'vpnctl: not ready:' "${WORK}/health.log"; then
+  ok "an unhealthy check writes its reason to the container log target"
+else
+  bad "the healthcheck reason never reached the container log target"
+fi
+health_lines=$(grep -c 'vpnctl: not ready:' "${WORK}/health.log" 2>/dev/null || printf 0)
+capture "${SH_BIN}" "${VPNCTL}" healthcheck
+health_lines2=$(grep -c 'vpnctl: not ready:' "${WORK}/health.log" 2>/dev/null || printf 0)
+if [ "${health_lines}" = "${health_lines2}" ]; then
+  ok "the same healthcheck reason is not repeated in the container log"
+else
+  bad "the healthcheck reason is logged on every interval"
+fi
 
 # An allow rule removed while the policies remain DROP must fail readiness too.
 printf '%s/32 dev wg0\n' "${HUB}" >>"${WORK}/state/routes"

@@ -290,6 +290,12 @@ a directory` (wrong mount path or `WG_CONFIG_PATH`), `not covered by AllowedIPs`
 kernel has no `wireguard` module), or `invalid PrivateKey` (the mount holds the
 fake template instead of the exported file).
 
+The readiness check also mirrors its first failure into that same log as
+`vpnctl: not ready: <reason>`, so an unhealthy container explains itself:
+`no readiness marker` means startup never finished, `the traffic guard is
+incomplete` means the rules were edited or the guard could not be installed, and
+`no route to <hub>` means the interface came up without its AllowedIPs route.
+
 ---
 
 ## 9. Log delivery semantics
