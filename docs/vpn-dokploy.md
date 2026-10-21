@@ -277,6 +277,12 @@ bind source into an empty directory), a configuration still holding
 `<PLACEHOLDER>` tokens, a `LOKI_PUSH_URL` whose host is not covered by
 `AllowedIPs`, or a `VPS_NAME` with an unsupported character.
 
+`vpnctl: ambiguous configuration input: WG_CONFIG_BASE64 is set and …` means both
+inputs are present at once: the environment variable has a value **and** the
+mounted `/config/wg0.conf` exists. Remove `WG_CONFIG_BASE64` from the Environment
+tab (or set it empty) and keep the File Mount; the restart loop then stops
+immediately.
+
 The container can also be *running* while the healthcheck never passes; the same
 log shows why. It never contains key material:
 

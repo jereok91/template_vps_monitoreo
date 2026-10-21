@@ -237,6 +237,10 @@ address (`not covered by AllowedIPs`), no `wireguard` module on the host
 (`cannot create wg0`), or the fake template mounted instead of the real file
 (`invalid PrivateKey`).
 
+`ambiguous configuration input` means `WG_CONFIG_BASE64` has a value **and** the
+mounted file exists: remove the variable from Dokploy's Environment tab. Use
+`sudo docker logs vpn` (or `docker compose -p <app> logs vpn`) to read the reason.
+
 ---
 
 ## Tests

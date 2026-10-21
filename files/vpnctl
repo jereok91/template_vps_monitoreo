@@ -312,11 +312,19 @@ resolve_config() {
   [ -n "$WG_CONFIG_BASE64" ] && rs_has_b64=1
 
   if [ "$rs_has_b64" = 1 ]; then
-    rs_conflict=0
-    [ "$CONFIG_FILE_EXPLICIT" = 1 ] && rs_conflict=1
-    [ -e "$VPN_CONFIG_FILE" ] && rs_conflict=1
-    if [ "$rs_conflict" = 1 ]; then
-      die 2 "ambiguous configuration input: set either VPN_CONFIG_FILE or WG_CONFIG_BASE64, not both"
+    rs_why=''
+    if [ "$CONFIG_FILE_EXPLICIT" = 1 ]; then
+      rs_why="VPN_CONFIG_FILE is set to $VPN_CONFIG_FILE"
+    fi
+    if [ -e "$VPN_CONFIG_FILE" ]; then
+      if [ -n "$rs_why" ]; then
+        rs_why="$rs_why and $VPN_CONFIG_FILE exists"
+      else
+        rs_why="$VPN_CONFIG_FILE exists"
+      fi
+    fi
+    if [ -n "$rs_why" ]; then
+      die 2 "ambiguous configuration input: WG_CONFIG_BASE64 is set and $rs_why. Remove WG_CONFIG_BASE64 from the environment and keep the mounted file (recommended), or unmount the file and use only WG_CONFIG_BASE64"
     fi
     mkdir -p "$VPN_RUN_DIR" 2>/dev/null || die 2 "cannot create VPN_RUN_DIR=$VPN_RUN_DIR"
     rs_out="${VPN_RUN_DIR}/${VPN_WG_IFACE}.conf"

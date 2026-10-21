@@ -128,6 +128,8 @@ set -e
 ERR="$(cat "${WORK}/stderr")"
 expect_rc 2 "file input plus base64 input is rejected as ambiguous"
 expect_err_contains "ambiguous" "ambiguity is named"
+expect_err_contains "WG_CONFIG_BASE64 is set" "ambiguity names the base64 input"
+expect_err_contains "exists" "ambiguity names the mounted file"
 
 # ---------------------------------------------------------------------------
 # Unexpected arguments are rejected instead of silently ignored (review finding).

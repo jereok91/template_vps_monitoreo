@@ -328,6 +328,14 @@ The exact VPS cause still needs `docker compose -p <app> logs --tail 100 vpn`;
 `docs/vpn-dokploy.md` lists the messages to look for (mount path, uncovered
 `LOKI_PUSH_URL`, missing kernel module, placeholder keys).
 
+The third deployment's container log (a screenshot of `sudo docker logs vpn`)
+showed the real cause: the operator's Dokploy environment had a non-empty
+`WG_CONFIG_BASE64` while the `wg0.conf` File Mount also existed, so `vpnctl`
+refused the ambiguous pair by design and restart-looped. The diagnostic message now
+names both inputs and the fix (remove `WG_CONFIG_BASE64`), and the guide lists the
+exact string. This was configuration, not a template defect; the IPv6-optional
+guard remains a valid hardening.
+
 A second deployment of the same fix still failed, so the container's own log is the
 remaining evidence. The readiness check mirrors its first failure of each distinct
 cause to a configurable target (a best-effort copy into the container log; the
