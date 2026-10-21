@@ -290,11 +290,26 @@ a directory` (wrong mount path or `WG_CONFIG_PATH`), `not covered by AllowedIPs`
 kernel has no `wireguard` module), or `invalid PrivateKey` (the mount holds the
 fake template instead of the exported file).
 
-The readiness check also mirrors its first failure into that same log as
-`vpnctl: not ready: <reason>`, so an unhealthy container explains itself:
+A startup failure always leaves its own `vpnctl:` line in that log. The readiness
+check's reason lives in Docker's health state:
+
+```bash
+docker inspect --format '{{json .State.Health}}' vpn
+```
+
 `no readiness marker` means startup never finished, `the traffic guard is
-incomplete` means the rules were edited or the guard could not be installed, and
-`no route to <hub>` means the interface came up without its AllowedIPs route.
+incomplete` means a rule is missing or the guard could not be installed, and `no
+route to <hub>` means the interface came up without its AllowedIPs route.
+
+To see the exact failure on the terminal without hunting for logs, run the same
+startup in a throwaway container (no ports, its own namespace, nothing else
+touched):
+
+```bash
+cd /etc/dokploy/compose/<app>/code
+docker compose -p <app> run --rm --no-deps vpn check-config   # pure validation
+timeout 60 docker compose -p <app> run --rm --no-deps vpn up  # prints the failure
+```
 
 ---
 

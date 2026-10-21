@@ -328,8 +328,10 @@ The exact VPS cause still needs `docker compose -p <app> logs --tail 100 vpn`;
 `docs/vpn-dokploy.md` lists the messages to look for (mount path, uncovered
 `LOKI_PUSH_URL`, missing kernel module, placeholder keys).
 
-A second deployment of the same fix still failed, so the container log is the
-remaining evidence; the readiness check now mirrors the first failure of each
-distinct cause into the container log (`vpnctl: not ready: <reason>`) so
-`docker compose logs vpn` explains an unhealthy deploy without shell access to the
-inside of the container.
+A second deployment of the same fix still failed, so the container's own log is the
+remaining evidence. The readiness check mirrors its first failure of each distinct
+cause to a configurable target (a best-effort copy into the container log; the
+authoritative copy is Docker's health state, `docker inspect ... .State.Health`).
+The guide now documents the throwaway-container command that prints the exact
+startup failure on the terminal, because Dokploy's deploy log never contains
+container output.

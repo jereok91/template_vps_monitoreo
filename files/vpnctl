@@ -336,6 +336,9 @@ resolve_config() {
   if [ ! -f "$VPN_CONFIG_FILE" ]; then
     die 2 "configuration file not found: $VPN_CONFIG_FILE (mount the generated client config read-only, or provide WG_CONFIG_BASE64)"
   fi
+  if [ ! -r "$VPN_CONFIG_FILE" ]; then
+    die 2 "configuration file is not readable inside the container: check the mount owner/mode (the container drops every capability, so root cannot bypass a file owned by another user; chown root:root and chmod 600 the File Mount)"
+  fi
   CONF_SRC=$VPN_CONFIG_FILE
   return 0
 }

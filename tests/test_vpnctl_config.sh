@@ -100,6 +100,14 @@ run_check "${WORK}/does-not-exist.conf"
 expect_rc 2 "missing client config fails"
 expect_err_contains "not found" "missing config explains itself"
 
+# A secret mount that root cannot read must fail with an actionable message.
+cp "${WORK}/valid.conf" "${WORK}/unreadable.conf"
+chmod 000 "${WORK}/unreadable.conf"
+run_check "${WORK}/unreadable.conf"
+expect_rc 2 "an unreadable client config fails"
+expect_err_contains "not readable" "the unreadable mount is explained"
+chmod 600 "${WORK}/unreadable.conf"
+
 mkdir -p "${WORK}/confdir"
 run_check "${WORK}/confdir"
 expect_rc 2 "a directory at the config path fails"
